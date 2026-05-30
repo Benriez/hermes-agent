@@ -6237,14 +6237,124 @@ class HermesCLI:
         print("  Example: python cli.py --toolsets web,terminal")
         print()
     
-    def _handle_profile_command(self):
-        """Display active profile name and home directory."""
+    def _handle_profile_command(self, command: str = ""):
+        """Display or apply the active CLI profile.
+
+        Supports subcommands:
+          /profile          — show profile name and home
+          /profile status   — show extended profile status with model/provider info
+          /profile <name>   — switch this CLI session to a profile's model/provider
+        """
         from hermes_constants import display_hermes_home
         from hermes_cli.profiles import get_active_profile_name
 
         display = display_hermes_home()
         profile_name = get_active_profile_name()
 
+        # Parse subcommand from command string. Preserve the raw argument for
+        # profile names while using a lowercase copy only for fixed subcommands.
+        parts = command.strip().split(None, 1)
+        subcommand_raw = parts[1].strip() if len(parts) > 1 else ""
+        subcommand = subcommand_raw.lower()
+
+        if subcommand == "status":
+            # Extended status output
+            provider = getattr(self, "provider", "auto")
+            model = getattr(self, "model", "unknown")
+            api_mode = getattr(self, "api_mode", "chat_completions")
+            session_key = getattr(self, "session_id", "")
+            cached_agent = getattr(self, "agent", None) is not None
+
+            # Check for session override — in CLI context, override is set
+            # when the user ran /model <name> during this session.
+            override_present = False
+            override_source = "none"
+            # The CLI's override mechanism lives in self.agent overrides;
+            # if self.model doesn't match the config model, show it.
+            from hermes_cli.config import load_config as _load_cli_config
+            try:
+                _cfg = _load_cli_config()
+                _cfg_model = _cfg.get("model", {}).get("default", "")
+                if model and _cfg_model and model != _cfg_model:
+                    override_present = True
+                    override_source = "session (/model)"
+            except Exception:
+                pass
+
+            print()
+            print("  PROFILE_STATUS")
+            print(f"  active_profile: {profile_name}")
+            print(f"  effective_model: {model}")
+            print(f"  effective_provider: {provider}")
+            print(f"  api_mode: {api_mode}")
+            print(f"  override_present: {'true' if override_present else 'false'}")
+            print(f"  override_source: {override_source}")
+            print(f"  session_key: {session_key}")
+            print(f"  cached_agent_present: {'true' if cached_agent else 'false'}")
+            print()
+            return
+
+        if subcommand_raw:
+            from hermes_cli.profiles import (
+                get_profile_dir,
+                normalize_profile_name,
+                profile_exists,
+                _read_config_model,
+            )
+
+            try:
+                target_profile = normalize_profile_name(subcommand_raw)
+            except Exception as exc:
+                print()
+                print(f"  Profile '{subcommand_raw}' does not exist ({exc})")
+                print()
+                return
+
+            if not profile_exists(target_profile):
+                print()
+                print(f"  Profile '{target_profile}' does not exist")
+                print()
+                return
+
+            model, provider = _read_config_model(get_profile_dir(target_profile))
+            if not model and not provider:
+                print()
+                print(f"  Profile '{target_profile}' has no model or provider override")
+                print()
+                return
+
+            old_model = getattr(self, "model", None)
+            if model:
+                self.model = model
+            if provider:
+                self.provider = provider
+                self.requested_provider = provider
+
+            if getattr(self, "agent", None) is not None:
+                try:
+                    self.agent.switch_model(
+                        new_model=self.model,
+                        new_provider=getattr(self, "provider", None),
+                    )
+                except Exception as exc:
+                    print()
+                    print(f"  ⚠ Agent swap failed ({exc}); profile model applies to next session.")
+
+            self._pending_model_switch_note = (
+                f"[Note: profile {target_profile} switched the session model "
+                f"from {old_model} to {self.model} via {getattr(self, 'provider', provider)}. "
+                f"Adjust your self-identification accordingly.]"
+            )
+
+            print()
+            print(f"  ✓ Profile '{target_profile}' applied to this session")
+            print(f"  Model:    {self.model}")
+            print(f"  Provider: {getattr(self, 'provider', provider)}")
+            print("  (session only — config.yaml unchanged)")
+            print()
+            return
+
+        # Default: show brief profile info (original behavior)
         print()
         print(f"  Profile: {profile_name}")
         print(f"  Home:    {display}")
@@ -8420,7 +8530,7 @@ class HermesCLI:
         elif canonical == "help":
             self.show_help()
         elif canonical == "profile":
-            self._handle_profile_command()
+            self._handle_profile_command(cmd_original)
         elif canonical == "tools":
             self._handle_tools_command(cmd_original)
         elif canonical == "toolsets":

@@ -618,14 +618,14 @@ class ContextCompressor(ContextEngine):
             config_context_length=config_context_length,
             provider=provider,
         )
-        # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
-        # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
-        # for models right at the minimum.
-        self.threshold_tokens = max(
-            int(self.context_length * threshold_percent),
-            MINIMUM_CONTEXT_LENGTH,
-        )
+        # Threshold is 75% of context_length, giving a 25% safety headroom.
+        # For an 8k model: threshold=6144 (safely below 8k).
+        # For a 64k model: threshold=49152 (safely below 64k).
+        # For a 256k model: threshold=196608 (safely below 256k).
+        # Formerly this was: max(int(context_length * threshold_percent), MINIMUM_CONTEXT_LENGTH)
+        # but the 64k floor made compression impossible for models with context < 64k
+        # (e.g. gemma with 8k context would overflow before compression could fire).
+        self.threshold_tokens = int(self.context_length * 0.75)
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context

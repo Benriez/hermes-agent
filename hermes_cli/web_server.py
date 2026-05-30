@@ -320,7 +320,9 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "stt.provider": {
         "type": "select",
         "description": "Speech-to-text provider",
-        "options": ["local", "openai", "mistral"],
+        # "mistral" temporarily removed — mistralai PyPI package quarantined
+        # (malicious 2.4.6 release on 2026-05-12). Restore once available.
+        "options": ["local", "openai"],
     },
     "display.skin": {
         "type": "select",
@@ -1046,7 +1048,7 @@ def get_model_options():
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        return build_models_payload(load_picker_context(), max_models=50)
+        return build_models_payload(load_picker_context(), max_models=200)
     except Exception:
         _log.exception("GET /api/model/options failed")
         raise HTTPException(status_code=500, detail="Failed to list model options")
@@ -2659,7 +2661,10 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
 
 def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
     annotated = dict(job)
-    annotated["profile"] = profile
+    # Preserve the job's stored profile (running profile) and add the
+    # storage-location profile as a separate annotation for routing.
+    stored_profile = annotated.get("profile")
+    annotated["profile"] = stored_profile or profile
     annotated["profile_name"] = profile
     annotated["hermes_home"] = str(home)
     annotated["is_default_profile"] = profile == "default"
@@ -2815,6 +2820,70 @@ async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return {"ok": True}
 
 
+@app.get("/api/cron/jobs/{job_id}/runs")
+async def list_cron_job_runs(job_id: str):
+    """List all historical runs for a cron job."""
+    from cron.run_history import list_runs
+    try:
+        runs = list_runs(job_id)
+        return {"job_id": job_id, "runs": runs}
+    except Exception as e:
+        _log.exception("Failed to list runs for job %s", job_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/cron/jobs/{job_id}/runs/{run_id}/log")
+async def get_cron_job_run_log(job_id: str, run_id: str, max_chars: int = 50_000):
+    """Get the sanitized log for a specific cron job run."""
+    from cron.run_history import get_run_log, get_run_metadata, get_run_log_size
+    try:
+        metadata = get_run_metadata(job_id, run_id)
+        log_content = get_run_log(job_id, run_id, max_chars=max_chars)
+        log_size = get_run_log_size(job_id, run_id)
+        if metadata is None and log_content is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return {
+            "job_id": job_id,
+            "run_id": run_id,
+            "metadata": metadata or {},
+            "log": log_content or "",
+            "log_size": log_size or 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.exception("Failed to get run log for job %s run %s", job_id, run_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/cron/runs/summary")
+async def get_all_cron_run_summaries():
+    """Get latest run summary for all jobs that have run history."""
+    from cron.run_history import get_runs_for_all_jobs
+    try:
+        all_runs = get_runs_for_all_jobs()
+        return {"runs": all_runs}
+    except Exception as e:
+        _log.exception("Failed to get all run summaries")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/cron/runs/{job_id}/latest")
+async def get_cron_job_latest_run(job_id: str):
+    """Get the latest run summary for a specific job."""
+    from cron.run_history import get_run_summary
+    try:
+        summary = get_run_summary(job_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="No runs found for this job")
+        return summary
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.exception("Failed to get latest run for job %s", job_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ---------------------------------------------------------------------------
 # Profile management endpoints (minimal — list/create/rename/delete + SOUL.md)
 # ---------------------------------------------------------------------------
@@ -2832,6 +2901,11 @@ class ProfileRename(BaseModel):
 
 class ProfileSoulUpdate(BaseModel):
     content: str
+
+
+class ProfileModelUpdate(BaseModel):
+    provider: Optional[str] = None
+    model: Optional[str] = None
 
 
 def _profile_attr(info, name: str, default: Any = None) -> Any:
@@ -3064,6 +3138,44 @@ async def update_profile_soul(name: str, body: ProfileSoulUpdate):
         _log.exception("PUT /api/profiles/%s/soul failed", name)
         raise HTTPException(status_code=500, detail=f"Could not write SOUL.md: {e}")
     return {"ok": True}
+
+
+@app.put("/api/profiles/{name}/model")
+async def update_profile_model(name: str, body: ProfileModelUpdate):
+    """Update a profile's model/provider in its config.yaml."""
+    profile_dir = _resolve_profile_dir(name)
+    config_path = profile_dir / "config.yaml"
+    import yaml
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+    else:
+        cfg = {}
+
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {"default": str(model_cfg)} if model_cfg else {}
+
+    if body.provider is not None:
+        model_cfg["provider"] = body.provider
+    if body.model is not None:
+        model_cfg["default"] = body.model
+
+    cfg["model"] = model_cfg
+
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+    except OSError as e:
+        _log.exception("PUT /api/profiles/%s/model failed", name)
+        raise HTTPException(status_code=500, detail=f"Could not write config.yaml: {e}")
+    return {"ok": True, "provider": model_cfg.get("provider"), "model": model_cfg.get("default")}
 
 
 # ---------------------------------------------------------------------------
@@ -3371,18 +3483,9 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     """Check if the WebSocket client IP is acceptable.
 
-    Loopback bind: only loopback clients allowed — the legacy
+    Loopback mode: only loopback clients allowed — the legacy
     ``?token=<_SESSION_TOKEN>`` path is the only auth we have, so we
     don't want LAN hosts guessing tokens.
-
-    Explicit non-loopback bind (``--host 0.0.0.0``, ``--host ::``, or a
-    specific address such as a Tailscale/LAN IP, always with
-    ``--insecure``): allow any peer. The operator explicitly opted into
-    non-loopback exposure, so the loopback-only peer restriction does not
-    apply. DNS-rebinding is still blocked by the Host/Origin guard in
-    :func:`_ws_host_origin_is_allowed`, which mirrors the HTTP layer and
-    requires the Host header to match the bound interface — the same
-    defence ``_is_accepted_host`` applies to non-loopback HTTP requests.
 
     Gated mode: any peer is allowed — uvicorn's ``proxy_headers=True``
     (enabled when the OAuth gate is active so cookies can pick up
@@ -3393,14 +3496,6 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     blocks DNS-rebinding here, not the peer IP.
     """
     if getattr(app.state, "auth_required", False):
-        return True
-    # Any explicit non-loopback bind (0.0.0.0, ::, or a specific LAN /
-    # Tailscale address) means the operator opted into non-loopback
-    # access via --insecure.  The loopback-only peer gate only applies to
-    # an actual loopback bind; otherwise the WS handshake is rejected even
-    # though same-bind HTTP requests pass _is_accepted_host.
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
-    if bound_host and bound_host not in _LOOPBACK_HOSTS:
         return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
@@ -3491,10 +3586,27 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
 _event_channels: dict[str, set] = {}
 _event_lock = asyncio.Lock()
 
+# Per-channel PtyBridge registry — maps a channel id to the PtyBridge
+# spawned by /api/pty for that tab.  Used by /api/pty-cmd to inject
+# command keystrokes into the PTY (e.g. model/personality switches
+# initiated from the sidebar).  Registration/deregistration is handled
+# inside pty_ws().
+_pty_bridges: dict[str, "PtyBridge"] = {}
+_pty_bridges_lock = asyncio.Lock()
+
+# Latest session.info payload per channel, populated by _broadcast_event.
+# Used by /api/pty-cmd responses and /api/pty-runtime-model queries so the
+# frontend can learn the runtime model without depending on a live event
+# subscriber WebSocket.
+_last_runtime_info: dict[str, dict] = {}
+_last_runtime_info_lock = asyncio.Lock()
+
 
 def _resolve_chat_argv(
     resume: Optional[str] = None,
     sidecar_url: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -3510,6 +3622,13 @@ def _resolve_chat_argv(
     `sidecar_url` (when set) is forwarded as ``HERMES_TUI_SIDECAR_URL`` so
     the spawned ``tui_gateway.entry`` can mirror dispatcher emits to the
     dashboard's ``/api/pub`` endpoint (see :func:`pub_ws`).
+
+    `model` and `provider` set ``HERMES_INFERENCE_MODEL`` and
+    ``HERMES_TUI_PROVIDER`` in the child env, so the new PTY session starts
+    with the selected runtime instead of the global default.  This is the
+    canonical per-session model-override path used by
+    :func:`_model_switch_rebuild_impl` — it does NOT touch config.yaml or
+    change any global default.
     """
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
 
@@ -3533,6 +3652,18 @@ def _resolve_chat_argv(
 
     if sidecar_url:
         env["HERMES_TUI_SIDECAR_URL"] = sidecar_url
+
+    # Per-session model/provider override — set env vars BEFORE spawning
+    # the PTY so tui_gateway._resolve_startup_runtime() picks them up.
+    # This is the startup-time equivalent of ``hermes --tui --model …``
+    # but scoped to a single dashboard tab restart.  It never touches
+    # config.yaml or any global default.
+    if model:
+        env["HERMES_MODEL"] = model
+        env["HERMES_INFERENCE_MODEL"] = model
+    if provider:
+        env["HERMES_TUI_PROVIDER"] = provider
+        env["HERMES_INFERENCE_PROVIDER"] = provider
 
     return list(argv), str(cwd) if cwd else None, env
 
@@ -3575,6 +3706,20 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
 
 async def _broadcast_event(channel: str, payload: str) -> None:
     """Fan out one publisher frame to every subscriber on `channel`."""
+    # Cache session.info payloads so /api/pty-cmd and the query endpoint
+    # can report the runtime model without relying on a live event subscriber.
+    try:
+        parsed = json.loads(payload)
+        if isinstance(parsed, dict) and parsed.get("method") == "event":
+            params = parsed.get("params")
+            if isinstance(params, dict) and params.get("type") == "session.info":
+                p = params.get("payload")
+                if isinstance(p, dict) and p.get("model"):
+                    async with _last_runtime_info_lock:
+                        _last_runtime_info[channel] = p
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     async with _event_lock:
         subs = list(_event_channels.get(channel, ()))
 
@@ -3627,9 +3772,34 @@ async def pty_ws(ws: WebSocket) -> None:
     resume = ws.query_params.get("resume") or None
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
+    # Per-session model/provider override from query params.  Set by the
+    # frontend after /api/model-switch/rebuild returns so the replacement
+    # PTY starts with the selected runtime.  Validated against injection
+    # (newlines / NUL) before use.
+    pty_model_raw = ws.query_params.get("model") or None
+    pty_provider_raw = ws.query_params.get("provider") or None
+    pty_model: Optional[str] = None
+    pty_provider: Optional[str] = None
+    if pty_model_raw:
+        err = _validate_pty_token(pty_model_raw, field="model")
+        if err is not None:
+            await ws.send_text(f"\r\n\x1b[31mInvalid model parameter: {err}\x1b[0m\r\n")
+            await ws.close(code=4400)
+            return
+        pty_model = pty_model_raw.strip()
+    if pty_provider_raw:
+        err = _validate_pty_token(pty_provider_raw, field="provider")
+        if err is not None:
+            await ws.send_text(f"\r\n\x1b[31mInvalid provider parameter: {err}\x1b[0m\r\n")
+            await ws.close(code=4400)
+            return
+        pty_provider = pty_provider_raw.strip()
 
     try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+        argv, cwd, env = _resolve_chat_argv(
+            resume=resume, sidecar_url=sidecar_url,
+            model=pty_model, provider=pty_provider,
+        )
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
@@ -3647,6 +3817,11 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
+
+    # Register this bridge for /api/pty-cmd
+    if channel:
+        async with _pty_bridges_lock:
+            _pty_bridges[channel] = bridge
 
     loop = asyncio.get_running_loop()
 
@@ -3694,6 +3869,10 @@ async def pty_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
     finally:
+        # Deregister the bridge so /api/pty-cmd can't write to a closed PTY
+        if channel:
+            async with _pty_bridges_lock:
+                _pty_bridges.pop(channel, None)
         reader_task.cancel()
         try:
             await reader_task
@@ -3813,6 +3992,393 @@ async def events_ws(ws: WebSocket) -> None:
 
                 if not subs:
                     _event_channels.pop(channel, None)
+
+
+# ---------------------------------------------------------------------------
+# /api/pty-cmd — inject a command string into the PTY's stdin.
+#
+# The PTY runs `hermes --tui` which interprets keystrokes as TUI commands.
+# POSTing here writes the given `command` to the active PTY for the channel,
+# enabling the sidebar (or any dashboard component) to remotely execute a
+# command in the PTY's tui_gateway session (e.g. /model <name> after the
+# sidebar model picker selects a different model).
+#
+# Request body (JSON):
+#   { "channel": "<event-channel-id>", "command": "/model gemma-..." }
+#
+# Status codes:
+#   200  command written to PTY
+#   404  no PTY bridge found for this channel
+#   400  missing channel or command
+# ---------------------------------------------------------------------------
+
+
+class _PtyCmdBody(BaseModel):
+    channel: str
+    command: str
+
+
+@app.post("/api/pty-cmd")
+async def pty_cmd(body: _PtyCmdBody) -> JSONResponse:
+    try:
+        return await _pty_cmd_impl(body)
+    except Exception as exc:
+        _log.error("pty-cmd unexpected error for channel %s: %s", body.channel, exc, exc_info=True)
+        return JSONResponse(
+            {"accepted": False, "channel_found": True,
+             "command_written": False, "selected_model": body.command or "",
+             "error": f"internal error: {exc}"},
+            status_code=500,
+        )
+
+
+# How long /api/pty-cmd waits for the PTY-side gateway to publish a
+# session.info confirming a /model switch took effect on the active runtime
+# agent.  Long enough to cover a remote-credential resolve + Anthropic
+# client rebuild on a Pi, short enough that the operator doesn't sit
+# staring at a spinner if the runtime can't switch live.
+_MODEL_SWITCH_CONFIRM_S = 6.0
+_MODEL_SWITCH_POLL_INTERVAL_S = 0.1
+
+
+def _parse_model_switch_target(command: str) -> Optional[str]:
+    """Return the requested model name from a ``/model …`` slash command.
+
+    Returns ``None`` when the command is not a model switch (so the caller
+    can skip the confirmation path).  Strips the ``--global``, ``--refresh``,
+    and ``--provider <slug>`` flags so the comparison against the PTY's
+    reported runtime model is on the bare model identifier.
+    """
+    stripped = (command or "").strip()
+    if not stripped.startswith("/model"):
+        return None
+    parts = stripped.split(None, 1)
+    if len(parts) < 2:
+        # Bare ``/model`` opens the picker — nothing to confirm.
+        return None
+    tail = parts[1].strip()
+    # Drop the same flags hermes_cli.model_switch.parse_model_flags handles.
+    tokens = tail.split()
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in {"--global", "--refresh"}:
+            i += 1
+            continue
+        if t == "--provider":
+            i += 2  # skip flag + value
+            continue
+        out.append(t)
+        i += 1
+    if not out:
+        return None
+    return out[0]
+
+
+async def _await_runtime_model_switch(
+    channel: str,
+    target_model: str,
+    previous_model: Optional[str],
+    deadline_s: float,
+) -> tuple[bool, dict]:
+    """Poll the ``_last_runtime_info`` cache until the PTY confirms the switch.
+
+    Returns ``(switched, info)`` where ``info`` is the latest session.info
+    payload seen for the channel (possibly the pre-switch one if no new
+    frame arrived).  ``switched`` is True only when a new session.info
+    arrived AND its ``model`` equals the requested target.
+    """
+    loop = asyncio.get_event_loop()
+    end = loop.time() + max(0.0, deadline_s)
+    latest: dict = {}
+    while True:
+        async with _last_runtime_info_lock:
+            latest = dict(_last_runtime_info.get(channel) or {})
+        cur = latest.get("model") or ""
+        if cur and cur == target_model and cur != (previous_model or ""):
+            return True, latest
+        if loop.time() >= end:
+            return False, latest
+        await asyncio.sleep(_MODEL_SWITCH_POLL_INTERVAL_S)
+
+
+async def _pty_cmd_impl(body: _PtyCmdBody) -> JSONResponse:
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        return JSONResponse(
+            {"accepted": False, "channel_found": False,
+             "command_written": False, "selected_model": body.command or "",
+             "error": "chat not enabled"},
+            status_code=403,
+        )
+
+    if not body.channel or not body.command:
+        return JSONResponse(
+            {"accepted": False, "channel_found": False,
+             "command_written": False, "selected_model": body.command or "",
+             "error": "channel and command are required"},
+            status_code=400,
+        )
+
+    async with _pty_bridges_lock:
+        bridge = _pty_bridges.get(body.channel)
+
+    if bridge is None:
+        return JSONResponse(
+            {"accepted": False, "channel_found": False,
+             "command_written": False, "selected_model": body.command or "",
+             "error": "no active PTY for this channel"},
+            status_code=404,
+        )
+
+    # Detect /model switches so the response can carry a real confirmation
+    # instead of leaving the dashboard to race a 5s wall-clock timer.
+    target_model = _parse_model_switch_target(body.command)
+    previous_model: Optional[str] = None
+    if target_model is not None:
+        async with _last_runtime_info_lock:
+            prev = _last_runtime_info.get(body.channel) or {}
+            previous_model = prev.get("model") or None
+
+    # Write the command + newline to the PTY master
+    try:
+        bridge.write((body.command + "\n").encode("utf-8"))
+    except Exception as exc:
+        _log.warning("pty-cmd write failed for channel %s: %s", body.channel, exc)
+        return JSONResponse(
+            {"accepted": False, "channel_found": True,
+             "command_written": False, "selected_model": body.command or "",
+             "error": f"write failed: {exc}"},
+            status_code=500,
+        )
+
+    base_payload: dict = {
+        "accepted": True,
+        "channel_found": True,
+        "command_written": True,
+        "selected_model": body.command,
+    }
+
+    if target_model is None:
+        return JSONResponse(base_payload)
+
+    # Wait for the PTY-side gateway to publish a session.info confirming
+    # the swap.  Backed by the same _last_runtime_info cache /api/pty-runtime-model
+    # already serves, so this works even when no /api/events subscriber is open.
+    switched, latest = await _await_runtime_model_switch(
+        body.channel,
+        target_model,
+        previous_model,
+        _MODEL_SWITCH_CONFIRM_S,
+    )
+
+    base_payload.update({
+        "is_model_switch": True,
+        "requested_model": target_model,
+        "previous_model": previous_model or "",
+        "runtime_switched": switched,
+        "runtime_model": (latest.get("model") or "") if latest else "",
+        "runtime_provider": (latest.get("provider") or "") if latest else "",
+    })
+
+    if not switched:
+        # The dashboard now knows the live runtime did not apply the switch.
+        # Surface a structured action instead of a generic 5s timeout banner,
+        # so the operator can stop+rebuild rather than guess.
+        base_payload["action_required"] = "stop_runtime_then_rebuild"
+        base_payload["error"] = (
+            f"runtime did not switch to {target_model!r} within "
+            f"{_MODEL_SWITCH_CONFIRM_S:.0f}s — the active agent may be mid-turn "
+            "or unable to swap live; stop the runtime and try again"
+        )
+
+    return JSONResponse(base_payload)
+
+
+# ---------------------------------------------------------------------------
+# /api/pty-runtime-model — query the latest known runtime model for a channel.
+#
+# ---------------------------------------------------------------------------
+# /api/model-switch/rebuild — real PTY session rebuild.
+#
+# Invoked from the dashboard model picker when /api/pty-cmd returned
+# ``action_required="stop_runtime_then_rebuild"`` (i.e. the live in-place
+# swap did not take effect within _MODEL_SWITCH_CONFIRM_S — typically
+# because the agent was mid-turn, the model_switch helper rejected the
+# combination, or the dispatcher silently kept the old binding).
+#
+# We deliberately do NOT auto-trigger this on first failure: stopping a
+# running session is a destructive operator action and must be explicit.
+# The frontend renders a confirmation button labelled "Restart session
+# with <model>"; only on that click does it call this endpoint.
+#
+# Steps:
+#   1. Validate auth/feature gate (inherited from middleware + chat flag).
+#   2. Validate body and resolve the channel's PTY bridge.
+#   3. Snapshot previous_model from _last_runtime_info.
+#   4. Close / dispose the current PTY bridge (SIGHUP → SIGTERM → SIGKILL).
+#   5. Remove the bridge from _pty_bridges and clear _last_runtime_info.
+#   6. Return {accepted: true, rebuilt: true, model, provider, ...}
+#      The frontend then reconnects the PTY WebSocket with
+#      ?model=...&provider=... in the URL, and the new pty_ws handler
+#      spawns a fresh PTY with the selected runtime via env vars.
+#
+# This is a REAL rebuild: the old agent process is terminated and a new
+# one starts with the selected model/provider from the beginning.  It
+# does NOT retry /interrupt + /model — that approach failed because
+# in-place agent.switch_model() can silently reject or revert.
+#
+# Request body (JSON):
+#   { "channel": "<id>", "model": "<name>", "provider": "<slug>" }   (provider optional)
+#
+# Status codes:
+#   200  rebuild completed (see ``rebuilt`` for outcome)
+#   400  missing channel/model, or model/provider contained newlines
+#   403  feature flag disabled
+#   404  no PTY bridge for this channel
+#   500  unexpected error
+# ---------------------------------------------------------------------------
+
+
+class _ModelSwitchRebuildBody(BaseModel):
+    channel: str
+    model: str
+    provider: Optional[str] = None
+
+
+def _validate_pty_token(value: str, *, field: str) -> Optional[str]:
+    """Reject PTY-injected tokens that contain newlines or NUL.
+
+    /api/model-switch/rebuild assembles raw command lines and writes them
+    into a PTY master.  A model or provider containing ``\\n`` would let
+    a caller smuggle additional slash commands; ``\\0`` would tear the
+    line apart on the receiving Ink TUI.  Return an error string when
+    rejecting, ``None`` when safe.
+    """
+    if "\n" in value or "\r" in value or "\x00" in value:
+        return f"{field} must not contain newline or NUL characters"
+    return None
+
+
+@app.post("/api/model-switch/rebuild")
+async def model_switch_rebuild(body: _ModelSwitchRebuildBody) -> JSONResponse:
+    try:
+        return await _model_switch_rebuild_impl(body)
+    except Exception as exc:
+        _log.error(
+            "model-switch/rebuild unexpected error for channel %s: %s",
+            body.channel, exc, exc_info=True,
+        )
+        return JSONResponse(
+            {"accepted": False, "rebuilt": False,
+             "requested_model": body.model or "",
+             "error": f"internal error: {exc}"},
+            status_code=500,
+        )
+
+
+async def _model_switch_rebuild_impl(body: _ModelSwitchRebuildBody) -> JSONResponse:
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        return JSONResponse(
+            {"accepted": False, "rebuilt": False,
+             "requested_model": body.model or "",
+             "error": "chat not enabled"},
+            status_code=403,
+        )
+
+    model = (body.model or "").strip()
+    provider = (body.provider or "").strip() or None
+
+    if not body.channel or not model:
+        return JSONResponse(
+            {"accepted": False, "rebuilt": False,
+             "requested_model": model,
+             "error": "channel and model are required"},
+            status_code=400,
+        )
+
+    for value, field in ((model, "model"), (provider or "", "provider")):
+        err = _validate_pty_token(value, field=field)
+        if err:
+            return JSONResponse(
+                {"accepted": False, "rebuilt": False,
+                 "requested_model": model, "error": err},
+                status_code=400,
+            )
+
+    async with _pty_bridges_lock:
+        bridge = _pty_bridges.get(body.channel)
+    if bridge is None:
+        return JSONResponse(
+            {"accepted": False, "rebuilt": False,
+             "requested_model": model,
+             "error": "no active PTY for this channel"},
+            status_code=404,
+        )
+
+    async with _last_runtime_info_lock:
+        prev = _last_runtime_info.get(body.channel) or {}
+        previous_model = prev.get("model") or ""
+        previous_provider = prev.get("provider") or ""
+
+    # Step 1: close the existing PTY bridge.  This sends SIGHUP, waits
+    # 0.5s, escalates to SIGTERM, waits 0.5s, then SIGKILL.  The old
+    # agent process is fully terminated — we do NOT attempt an in-place
+    # switch because that path has proven unreliable.
+    try:
+        bridge.close()
+    except Exception as exc:
+        _log.warning(
+            "model-switch/rebuild: error closing old PTY bridge for channel %s: %s",
+            body.channel, exc,
+        )
+
+    # Step 2: deregister the bridge and clear cached runtime info.
+    async with _pty_bridges_lock:
+        _pty_bridges.pop(body.channel, None)
+    async with _last_runtime_info_lock:
+        _last_runtime_info.pop(body.channel, None)
+
+    # Step 3: return success.  The frontend will reconnect the PTY
+    # WebSocket with model/provider query params, and the new pty_ws
+    # handler spawns a fresh PTY with those env vars set by
+    # _resolve_chat_argv().
+    return JSONResponse({
+        "accepted": True,
+        "rebuilt": True,
+        "requested_model": model,
+        "requested_provider": provider or "",
+        "previous_model": previous_model,
+        "previous_provider": previous_provider,
+        "action": "reconnect_pty",
+    })
+
+
+# Returns the most recent session.info payload cached from the PTY's event
+# publisher stream.  This gives the frontend a non-fire-and-forget fallback
+# when the event subscriber WebSocket is not connected or has missed frames.
+#
+# Query params:
+#   channel=<event-channel-id>
+#
+# Response (JSON):
+#   { "model": "...", "provider": "...", "found": true }
+# or 404 if no session.info has been cached for this channel.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/pty-runtime-model")
+async def pty_runtime_model(channel: str) -> JSONResponse:
+    if not channel:
+        return JSONResponse({"found": False, "error": "channel required"}, status_code=400)
+
+    async with _last_runtime_info_lock:
+        info = _last_runtime_info.get(channel)
+
+    if info is None:
+        return JSONResponse({"found": False, "error": "no runtime info for this channel"}, status_code=404)
+
+    return JSONResponse({"found": True, "model": info.get("model", ""), "provider": info.get("provider", "")})
 
 
 def _normalise_prefix(raw: Optional[str]) -> str:

@@ -349,6 +349,10 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
          any preceding assistant tool_call — dropped.
       2. Consecutive ``user`` messages — merged with newline separator
          so no user input is lost.
+      3. Consecutive ``assistant`` messages — merged with newline
+         separator so no assistant output is lost.
+      4. ``assistant`` immediately after ``system`` — a minimal user
+         wrapper is inserted to establish alternation.
 
     Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
     pairs that precede a user message — that pattern IS valid when the
@@ -422,10 +426,78 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 continue
         merged.append(msg)
 
+    # Pass 3: merge consecutive assistant messages. Preserves all
+    # assistant output so nothing is lost.
+    merged2: List[Dict] = []
+    for msg in merged:
+        if (
+            merged2
+            and isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and isinstance(merged2[-1], dict)
+            and merged2[-1].get("role") == "assistant"
+        ):
+            prev = merged2[-1]
+            prev_content = prev.get("content", "")
+            new_content = msg.get("content", "")
+            # Only merge plain-text content; leave multimodal (list)
+            # content alone.
+            if isinstance(prev_content, str) and isinstance(new_content, str):
+                prev["content"] = (
+                    (prev_content + "\n\n" + new_content)
+                    if prev_content and new_content
+                    else (prev_content or new_content)
+                )
+                # Merge tool_calls if present on the second message
+                prev_tcs = prev.get("tool_calls") or []
+                new_tcs = msg.get("tool_calls") or []
+                if new_tcs:
+                    prev["tool_calls"] = prev_tcs + new_tcs
+                repairs += 1
+                continue
+        merged2.append(msg)
+
+    # Pass 4: if conversation starts with assistant after system,
+    # insert a minimal user wrapper to establish alternation.
+    # This is required by local chat-template providers (llama.cpp,
+    # Ollama, vLLM) that enforce strict user/assistant alternation.
+    final: List[Dict] = []
+    for i, msg in enumerate(merged2):
+        if i == 0 and isinstance(msg, dict) and msg.get("role") == "system":
+            final.append(msg)
+        elif i > 0 and isinstance(msg, dict) and msg.get("role") == "assistant":
+            # Check if previous non-system message is also assistant
+            # (shouldn't happen after Pass 3, but guard anyway) or
+            # if this is the first non-system message and it's assistant.
+            prev_non_system = None
+            for j in range(len(final) - 1, -1, -1):
+                if isinstance(final[j], dict) and final[j].get("role") != "system":
+                    prev_non_system = final[j]
+                    break
+            if prev_non_system is None:
+                # First non-system message is assistant — insert user wrapper
+                final.append({"role": "user", "content": " "})
+                repairs += 1
+            elif prev_non_system.get("role") == "assistant":
+                # Safety net: consecutive assistant after Pass 3
+                prev_content = prev_non_system.get("content", "")
+                new_content = msg.get("content", "")
+                if isinstance(prev_content, str) and isinstance(new_content, str):
+                    prev_non_system["content"] = (
+                        (prev_content + "\n\n" + new_content)
+                        if prev_content and new_content
+                        else (prev_content or new_content)
+                    )
+                    repairs += 1
+                    continue
+            final.append(msg)
+        else:
+            final.append(msg)
+
     if repairs > 0:
         # Rewrite in place so downstream paths (persistence, return
         # value, session DB flush) see the repaired sequence.
-        messages[:] = merged
+        messages[:] = final
 
     return repairs
 

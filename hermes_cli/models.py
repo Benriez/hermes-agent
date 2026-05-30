@@ -248,6 +248,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "minimaxai/minimax-m2.5",
         "z-ai/glm5",
         "openai/gpt-oss-120b",
+        # Profile-specific NVIDIA NIM models (with nvidia/ prefix)
+        "nvidia/deepseek-ai/deepseek-v4-pro",
+        "nvidia/moonshotai/kimi-k2.6",
+        "nvidia/minimaxai/minimax-m2.7",
+        "nvidia/minimaxai/minimax-m2.5",
     ],
     "kimi-coding": [
         "kimi-k2.6",

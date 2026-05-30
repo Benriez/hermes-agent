@@ -34,13 +34,18 @@ import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
 
 import { cn } from "@/lib/utils";
 import { AlertCircle, ChevronDown, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 interface SessionInfo {
   cwd?: string;
   model?: string;
   provider?: string;
   credential_warning?: string;
+}
+
+interface PtySessionInfo {
+  model?: string;
+  provider?: string;
 }
 
 interface RpcEnvelope {
@@ -50,16 +55,21 @@ interface RpcEnvelope {
 
 const TOOL_LIMIT = 20;
 
-const STATE_LABEL: Record<ConnectionState, string> = {
+type BadgeKind = "live" | "switching" | "stale" | ConnectionState;
+
+const BADGE_LABEL: Record<BadgeKind, string> = {
   idle: "idle",
   connecting: "connecting",
   open: "live",
   closed: "closed",
   error: "error",
+  live: "live",
+  switching: "switching",
+  stale: "stale",
 };
 
-const STATE_TONE: Record<
-  ConnectionState,
+const BADGE_TONE: Record<
+  BadgeKind,
   "secondary" | "warning" | "success" | "destructive"
 > = {
   idle: "secondary",
@@ -67,14 +77,73 @@ const STATE_TONE: Record<
   open: "success",
   closed: "secondary",
   error: "destructive",
+  live: "success",
+  switching: "warning",
+  stale: "warning",
 };
+
+// Model sync status reported to ChatPage for send-guarding.
+export type ModelSyncState =
+  | { status: "live"; selectedModel: string; runtimeModel: string }
+  | { status: "switching"; selectedModel: string; runtimeModel: string | null }
+  | { status: "stale"; selectedModel: string | null; runtimeModel: string | null; reason: string }
+  | { status: "unknown"; selectedModel: string | null; runtimeModel: string | null };
 
 interface ChatSidebarProps {
   channel: string;
   className?: string;
+  /** Called whenever the model sync state (live/switching/stale) changes. */
+  onSyncStateChange?: (state: ModelSyncState) => void;
 }
 
-export function ChatSidebar({ channel, className }: ChatSidebarProps) {
+// Wall-clock fallback only — must exceed the backend's
+// _MODEL_SWITCH_CONFIRM_S (web_server.py, currently 6s) plus normal HTTP
+// latency so the backend's authoritative result wins under normal
+// conditions.  We only hit this timer when /api/pty-cmd itself never
+// returns (network drop, server hang).
+const MODEL_SWITCH_TIMEOUT_MS = 9000;
+
+// Parse the picker-emitted slash command (e.g.
+// ``/model kimi-k2.5 --provider opencode-go --global``) into its bare
+// model id and (optional) provider slug.  Mirrors
+// _parse_model_switch_target in hermes_cli/web_server.py — flags are
+// stripped, the first non-flag token after ``/model`` is the model, and
+// ``--provider <slug>`` (if present) yields the provider.  Returns
+// ``null`` for non-/model commands or bare ``/model``.
+function parseModelSlash(
+  slashCommand: string,
+): { model: string; provider: string | null } | null {
+  const trimmed = slashCommand.trim();
+  if (!trimmed.toLowerCase().startsWith("/model")) {
+    return null;
+  }
+  const tokens = trimmed.split(/\s+/).slice(1);
+  if (tokens.length === 0) {
+    return null;
+  }
+  let model: string | null = null;
+  let provider: string | null = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === "--provider" && i + 1 < tokens.length) {
+      provider = tokens[i + 1];
+      i++;
+      continue;
+    }
+    if (tok === "--global" || tok === "--refresh") {
+      continue;
+    }
+    if (tok.startsWith("--")) {
+      continue;
+    }
+    if (model === null) {
+      model = tok;
+    }
+  }
+  return model ? { model, provider } : null;
+}
+
+export function ChatSidebar({ channel, className, onSyncStateChange }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
   // counter is the dependency on purpose — it's not read in the memo body,
@@ -89,6 +158,51 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   const [tools, setTools] = useState<ToolEntry[]>([]);
   const [modelOpen, setModelOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runtimeModel, setRuntimeModel] = useState<string | null>(null);
+
+  // Tracks whether a model switch is pending runtime confirmation.
+  const [pendingModelSwitch, setPendingModelSwitch] = useState<string | null>(null);
+  const switchingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Set to {model, provider} when the live in-place /model swap timed out
+  // and the backend signalled action_required="stop_runtime_then_rebuild".
+  // Drives the explicit "Stop runtime and switch to <model>" CTA — the
+  // operator must click it to actually issue /interrupt + /model via the
+  // /api/model-switch/rebuild endpoint.  Stopping the active turn is a
+  // destructive action, so it is NEVER triggered automatically on first
+  // failure.
+  const [restartRequired, setRestartRequired] = useState<{
+    model: string;
+    provider: string | null;
+  } | null>(null);
+  const [restartInFlight, setRestartInFlight] = useState(false);
+
+  const syncStateRef = useRef<ModelSyncState>({ status: "unknown", selectedModel: null, runtimeModel: null });
+  const buildSyncState = useCallback((): ModelSyncState => {
+    const s = state;
+    const sm = info.model ?? null;
+    const rm = runtimeModel;
+
+    if (s !== "open") {
+      return { status: "unknown", selectedModel: sm, runtimeModel: rm } as ModelSyncState;
+    }
+    if (pendingModelSwitch) {
+      return { status: "switching", selectedModel: pendingModelSwitch, runtimeModel: rm } as ModelSyncState;
+    }
+    if (!rm) {
+      return { status: "stale", selectedModel: sm, runtimeModel: null, reason: "runtime model unknown" } as ModelSyncState;
+    }
+    if (sm === rm) {
+      return { status: "live", selectedModel: sm, runtimeModel: rm } as ModelSyncState;
+    }
+    return { status: "stale", selectedModel: sm, runtimeModel: rm, reason: `selected ${sm} differs from runtime ${rm}` } as ModelSyncState;
+  }, [state, info.model, runtimeModel, pendingModelSwitch]);
+
+  useEffect(() => {
+    const sync = buildSyncState();
+    syncStateRef.current = sync;
+    onSyncStateChange?.(sync);
+  }, [buildSyncState, onSyncStateChange]);
 
   useEffect(() => {
     let cancelled = false;
@@ -101,6 +215,24 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
 
       if (ev.payload) {
         setInfo((prev) => ({ ...prev, ...ev.payload }));
+
+        // Sidecar session.info updates the display model (for the picker
+        // label) but MUST NOT update runtimeModel or clear a pending
+        // model switch.  The sidecar and PTY have independent agents;
+        // the sidecar confirming a /model switch only means the sidecar's
+        // own agent switched — it says nothing about the PTY's agent
+        // state.  Treating it as authoritative causes the badge to show
+        // "live" even when the PTY's real agent is still on a different
+        // model (see _apply_model_switch in tui_gateway/server.py which
+        // emits session.info after switching the *local* agent only).
+        //
+        // The PTY's session.info (received via the event feed below)
+        // is the authoritative source for runtimeModel and pending switch
+        // resolution — it reflects the actual agent running in the PTY.
+        if (ev.payload.model) {
+          // Update info.model for the picker display label only.
+          // DO NOT set runtimeModel or clear pendingModelSwitch here.
+        }
       }
     });
 
@@ -204,6 +336,38 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
 
       const { type, payload } = frame.params;
 
+      if (type === "session.info") {
+        const p = payload as PtySessionInfo | undefined;
+        if (p?.model) {
+          // PTY session.info is the authoritative source for the
+          // actual runtime model — it reflects the real agent running
+          // in the PTY child process.  Always accept it.
+          setRuntimeModel(p.model);
+
+          // Also update the display model so the badge label matches
+          // the PTY's confirmed runtime.  Without this, the badge
+          // shows the sidecar's independent session default (e.g.
+          // deepseek-v4-pro) even after a rebuild started the PTY
+          // with a different model (e.g. kimi-k2.6), producing a
+          // permanent "stale" warning.
+          setInfo((prev) => {
+            const next: SessionInfo = { ...prev, model: p.model };
+            if (p.provider) next.provider = p.provider;
+            return next;
+          });
+
+          // If a model switch was pending and the runtime now matches,
+          // clear the pending state.
+          setPendingModelSwitch((prev) => {
+            if (prev && p.model === prev) {
+              return null;
+            }
+            return prev;
+          });
+        }
+        return;
+      }
+
       if (type === "tool.start") {
         const p = payload as
           | { tool_id?: string; name?: string; context?: string }
@@ -289,26 +453,299 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
   }, []);
 
   // Picker hands us a fully-formed slash command (e.g. "/model anthropic/...").
-  // Fire-and-forget through `slash.exec`; the TUI pane will render the result
-  // via PTY, so the sidebar doesn't need to surface output of its own.
+  // Two-step handoff: (1) sidecar session gets the override via slash.exec,
+  // (2) we inject the same command into the PTY via /api/pty-cmd so the
+  // actual agent loop switches models.  The PTY will then emit
+  // session.info (captured from the events WS) updating runtimeModel.
   const onModelSubmit = useCallback(
     (slashCommand: string) => {
       if (!sessionId) {
         return;
       }
 
+      // Step 1: sidecar override (model badge / picker state)
       void gw.request("slash.exec", {
         session_id: sessionId,
         command: slashCommand,
       });
+
+      // Step 2: PTY injection — fire /api/pty-cmd and check acceptance.
+      // Set switching state; a timeout will revert to stale if no
+      // runtime confirmation arrives.
+      const modelName = slashCommand.startsWith("/model ")
+        ? slashCommand.slice("/model ".length).trim()
+        : slashCommand;
+
+      setPendingModelSwitch(modelName);
+
+      // Clear any previous timeout
+      if (switchingTimeoutRef.current) {
+        clearTimeout(switchingTimeoutRef.current);
+      }
+
+      void (async () => {
+        // Auth for REST /api/pty-cmd differs from WS query params:
+        // - Loopback mode: X-Hermes-Session-Token header (matching
+        //   _has_valid_session_token in web_server.py)
+        // - Gated mode: credentials: "include" so the cookie-based
+        //   gated_auth_middleware reads the session cookie.
+        // buildWsAuthParam() returns ['token', ...] or ['ticket', ...]
+        // designed for WebSocket ?token= / ?ticket= query params —
+        // those are NOT valid REST auth headers.
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+        const gated = window.__HERMES_AUTH_REQUIRED__;
+        if (!gated) {
+          const sessionToken = window.__HERMES_SESSION_TOKEN__;
+          if (!sessionToken) {
+            setPendingModelSwitch((prev) => (prev === modelName ? null : prev));
+            return;
+          }
+          headers["X-Hermes-Session-Token"] = sessionToken;
+        }
+        try {
+          const resp = await fetch(
+            `${window.location.protocol}//${window.location.host}${HERMES_BASE_PATH}/api/pty-cmd`,
+            {
+              method: "POST",
+              headers,
+              // credentials: "include" is essential for gated mode
+              // (cookie auth) and harmless in loopback mode.
+              credentials: "include",
+              body: JSON.stringify({ channel, command: slashCommand }),
+            },
+          );
+          const data = await resp.json();
+
+          if (!data.accepted) {
+            // /api/pty-cmd rejected the command — show error and
+            // revert pending state.
+            // Auth failures (401/403) take precedence over generic
+            // `detail` stringification so the operator sees an
+            // actionable "reload the page" instead of `"Unauthorized"`,
+            // which is what loopback auth_middleware returns as
+            // ``{"detail":"Unauthorized"}`` when the in-tab session
+            // token is stale after a dashboard restart.
+            let errMsg: string;
+            if (resp.status === 401 || resp.status === 403) {
+              errMsg = "Model switch rejected: authentication required — reload the page to refresh the dashboard session token.";
+            } else if (data.channel_found === false) {
+              errMsg = "No active chat session — model switch cannot be applied.";
+            } else if (data.error) {
+              errMsg = `Model switch rejected: ${data.error}`;
+            } else if (data.detail) {
+              // FastAPI returns 422 validation errors with `detail` field
+              // instead of the expected shape.  Extract a user-facing
+              // message from the validation error list.
+              const detail = data.detail;
+              if (Array.isArray(detail) && detail.length > 0) {
+                const locs = detail.map((d: { loc?: string[]; msg?: string }) =>
+                  d.loc ? d.loc.join(".") : ""
+                ).filter(Boolean).join(", ");
+                const msgs = detail.map((d: { msg?: string }) => d.msg || "").filter(Boolean).join("; ");
+                errMsg = `Model switch rejected: validation error${locs ? ` in ${locs}` : ""}${msgs ? ` — ${msgs}` : ""}`;
+              } else {
+                errMsg = `Model switch rejected: ${JSON.stringify(detail)}`;
+              }
+            } else {
+              errMsg = `Model switch rejected: server returned ${resp.status} with no error detail.`;
+            }
+            setError(errMsg);
+            setPendingModelSwitch((prev) => (prev === modelName ? null : prev));
+            return;
+          }
+
+          // For /model commands the backend now waits for the PTY-side
+          // gateway to confirm the switch via the cached session.info
+          // feed (see _await_runtime_model_switch in web_server.py).
+          // Use that authoritative result instead of racing a wall-clock
+          // timer that can't tell "still switching" from "runtime refused".
+          if (data.is_model_switch) {
+            // Cancel the fall-through wall-clock timer — the response
+            // already represents the runtime's final verdict.
+            if (switchingTimeoutRef.current) {
+              clearTimeout(switchingTimeoutRef.current);
+              switchingTimeoutRef.current = null;
+            }
+            if (data.runtime_switched && data.runtime_model) {
+              setRuntimeModel(data.runtime_model);
+              setPendingModelSwitch((prev) => (prev === modelName ? null : prev));
+              setError(null);
+              // Live swap worked — drop any prior rebuild CTA for this
+              // model so the operator doesn't see a stale call to action.
+              setRestartRequired(null);
+            } else {
+              // Structured restart-required signal from the backend.
+              const reqd = data.action_required === "stop_runtime_then_rebuild";
+              const tail = reqd
+                ? " Click \u201CStop runtime and switch\u201D below, or open a new session."
+                : "";
+              setError(
+                (data.error
+                  ? `Model switch did not apply: ${data.error}.`
+                  : `Model switch to "${modelName}" was sent but the runtime did not confirm the change.`)
+                + tail,
+              );
+              setPendingModelSwitch((prev) => (prev === modelName ? null : prev));
+              if (reqd) {
+                const parsed = parseModelSlash(slashCommand);
+                if (parsed) {
+                  setRestartRequired({ model: parsed.model, provider: parsed.provider });
+                }
+              }
+            }
+            return;
+          }
+        } catch {
+          // Network/parse error — fall back to the timeout; keep
+          // pending state so the badge shows "switching".
+        }
+      })();
+
+      // Wall-clock fallback for the case where /api/pty-cmd never returns
+      // (network drop, server hang): if the backend confirmation never
+      // arrives, revert to stale with the same actionable text the
+      // structured restart-required path uses.
+      switchingTimeoutRef.current = setTimeout(() => {
+        setPendingModelSwitch((prev) => {
+          if (prev !== modelName) {
+            return prev;
+          }
+          setError(
+            `Model switch to "${modelName}" was sent but not confirmed by runtime within ${MODEL_SWITCH_TIMEOUT_MS / 1000}s. ` +
+            "Click \u201CStop runtime and switch\u201D below, or open a new session.",
+          );
+          // Offer the same CTA the structured failure path offers, so
+          // a network drop doesn't strand the operator without a remedy.
+          const parsed = parseModelSlash(slashCommand);
+          if (parsed) {
+            setRestartRequired({ model: parsed.model, provider: parsed.provider });
+          }
+          return null;
+        });
+      }, MODEL_SWITCH_TIMEOUT_MS);
+
       setModelOpen(false);
     },
-    [gw, sessionId],
+    [gw, sessionId, channel],
   );
+
+  // Operator-initiated session rebuild: only fires when the user clicks
+  // the explicit "Restart session with <model>" CTA — stopping the
+  // running session is destructive, so we never auto-trigger it.  POSTs
+  // to the dashboard's /api/model-switch/rebuild endpoint, which closes
+  // the old PTY process and returns {rebuilt: true}.  On success we
+  // reload the page with ?model=...&provider=... in the URL so the new
+  // PTY starts with the selected runtime from the beginning.
+  const onForceRebuild = useCallback(async () => {
+    if (!restartRequired || restartInFlight) {
+      return;
+    }
+    const { model, provider } = restartRequired;
+    setRestartInFlight(true);
+    setPendingModelSwitch(model);
+    setError(null);
+    // Cancel any leftover wall-clock timer from the initial /model
+    // attempt — the rebuild endpoint owns confirmation now.
+    if (switchingTimeoutRef.current) {
+      clearTimeout(switchingTimeoutRef.current);
+      switchingTimeoutRef.current = null;
+    }
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const gated = window.__HERMES_AUTH_REQUIRED__;
+    if (!gated) {
+      const sessionToken = window.__HERMES_SESSION_TOKEN__;
+      if (!sessionToken) {
+        setError("Rebuild rejected: missing session token — reload the page.");
+        setPendingModelSwitch((prev) => (prev === model ? null : prev));
+        setRestartInFlight(false);
+        return;
+      }
+      headers["X-Hermes-Session-Token"] = sessionToken;
+    }
+
+    try {
+      const resp = await fetch(
+        `${window.location.protocol}//${window.location.host}${HERMES_BASE_PATH}/api/model-switch/rebuild`,
+        {
+          method: "POST",
+          headers,
+          credentials: "include",
+          body: JSON.stringify({ channel, model, provider: provider || undefined }),
+        },
+      );
+      const data = await resp.json().catch(() => ({}));
+      if (resp.status === 401 || resp.status === 403) {
+        setError(
+          "Rebuild rejected: authentication required — reload the page to refresh the dashboard session token.",
+        );
+        setPendingModelSwitch((prev) => (prev === model ? null : prev));
+        setRestartInFlight(false);
+        return;
+      }
+      // New rebuild flow: the backend killed the old PTY and returned
+      // {rebuilt: true}.  Reload the page with model/provider in URL
+      // params so the new PTY starts with the selected runtime.
+      if (data.rebuilt && data.requested_model) {
+        const next = new URLSearchParams(window.location.search);
+        next.set("model", data.requested_model);
+        if (data.requested_provider) {
+          next.set("provider", data.requested_provider);
+        }
+        // Remove resume param — this is a fresh session start.
+        next.delete("resume");
+        window.location.href =
+          window.location.pathname + "?" + next.toString() + window.location.hash;
+        return;
+      }
+      // Legacy or failure path: surface the error.
+      const errorMsg =
+        data.error
+          ? `Rebuild failed: ${data.error}.`
+          : `Rebuild did not confirm for model "${model}".`;
+      setError(errorMsg + " Try reloading the page manually.");
+      setPendingModelSwitch((prev) => (prev === model ? null : prev));
+      setRestartInFlight(false);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(`Force-switch network error: ${msg}`);
+      setPendingModelSwitch((prev) => (prev === model ? null : prev));
+    } finally {
+      setRestartInFlight(false);
+    }
+  }, [restartRequired, restartInFlight, channel]);
+
+  // Drop the rebuild CTA whenever /api/events delivers a session.info
+  // showing the runtime already matches the requested model — handles
+  // the case where the live swap eventually landed after the 6s window
+  // (the CTA would otherwise stay visible and confuse the operator).
+  useEffect(() => {
+    if (restartRequired && runtimeModel === restartRequired.model) {
+      setRestartRequired(null);
+    }
+  }, [runtimeModel, restartRequired]);
 
   const canPickModel = state === "open" && !!sessionId;
   const modelLabel = (info.model ?? "—").split("/").slice(-1)[0] ?? "—";
   const banner = error ?? info.credential_warning ?? null;
+
+  // Badge kind:
+  //   - switching: model switch command accepted, waiting for runtime conf.
+  //   - live: WS open AND selected model === runtime model AND no pending
+  //           switch (badge must never show "live" unless confirmed).
+  //   - stale: WS open but runtime model unknown or doesn't match selected.
+  const badgeKind: BadgeKind =
+    state !== "open"
+      ? state
+      : pendingModelSwitch
+        ? "switching"
+        : !runtimeModel
+          ? "stale"
+          : info.model === runtimeModel
+            ? "live"
+            : "stale";
 
   return (
     <aside
@@ -340,7 +777,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
           </Button>
         </div>
 
-        <Badge tone={STATE_TONE[state]}>{STATE_LABEL[state]}</Badge>
+        <Badge tone={BADGE_TONE[badgeKind]}>{BADGE_LABEL[badgeKind]}</Badge>
       </Card>
 
       {banner && (
@@ -362,6 +799,27 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
               </Button>
             )}
           </div>
+        </Card>
+      )}
+
+      {restartRequired && (
+        <Card className="flex flex-col gap-2 border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs">
+          <div className="wrap-break-word text-amber-700 dark:text-amber-300">
+            Live model switch to <span className="font-semibold">{restartRequired.model}</span>
+            {restartRequired.provider ? <> ({restartRequired.provider})</> : null} did not
+            take effect. Clicking the button below will restart the chat session
+            with the selected model — the current runtime will be stopped and a new
+            one started.
+          </div>
+          <Button
+            size="sm"
+            onClick={() => { void onForceRebuild(); }}
+            disabled={restartInFlight}
+          >
+            {restartInFlight
+              ? `Restarting with ${restartRequired.model}\u2026`
+              : `Restart session with ${restartRequired.model}`}
+          </Button>
         </Card>
       )}
 

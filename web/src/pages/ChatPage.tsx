@@ -31,7 +31,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router-dom";
 
-import { ChatSidebar } from "@/components/ChatSidebar";
+import { ChatSidebar, type ModelSyncState } from "@/components/ChatSidebar";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -41,6 +41,8 @@ function buildWsUrl(
   authParam: [string, string],
   resume: string | null,
   channel: string,
+  model: string | null = null,
+  provider: string | null = null,
 ): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   // ``authParam`` is ``["token", <session>]`` in loopback mode and
@@ -48,6 +50,12 @@ function buildWsUrl(
   // ``_ws_auth_ok`` picks whichever shape matches the current gate state.
   const qs = new URLSearchParams({ [authParam[0]]: authParam[1], channel });
   if (resume) qs.set("resume", resume);
+  // Per-session model/provider override — set from URL params after a
+  // /api/model-switch/rebuild triggered page reload.  The server-side
+  // pty_ws handler validates these and sets HERMES_INFERENCE_MODEL /
+  // HERMES_TUI_PROVIDER in the PTY child env.
+  if (model) qs.set("model", model);
+  if (provider) qs.set("provider", provider);
   return `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
 }
 
@@ -119,13 +127,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const [searchParams, setSearchParams] = useSearchParams();
   // Lazy-init: the missing-token check happens at construction so the effect
   // body doesn't have to setState (React 19's set-state-in-effect rule).
-  // In gated (OAuth) mode the server intentionally omits the session token —
-  // the SPA authenticates the WS via a single-use ticket (buildWsAuthParam),
-  // so a missing token there is expected, not an error.
   const [banner, setBanner] = useState<string | null>(() =>
-    typeof window !== "undefined" &&
-    !window.__HERMES_SESSION_TOKEN__ &&
-    !window.__HERMES_AUTH_REQUIRED__
+    typeof window !== "undefined" && !window.__HERMES_SESSION_TOKEN__
       ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
       : null,
   );
@@ -157,6 +160,29 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       : false,
   );
 
+  // Model sync state from ChatSidebar — used to block sends while stale.
+  const [modelSync, setModelSync] = useState<ModelSyncState>({
+    status: "unknown",
+    selectedModel: null,
+    runtimeModel: null,
+  });
+  // Ref keeps the latest sync state accessible from the onData closure
+  // inside the PTY-effect.
+  const modelSyncRef = useRef(modelSync);
+  modelSyncRef.current = modelSync;
+  // Tracks whether we've already shown the once-per-stale-cycle warning
+  // for the PTY Enter guard.  Reset whenever sync transitions back to
+  // "live" so the next stale transition warns again.
+  const modelSyncStaleWarnedRef = useRef(false);
+  useEffect(() => {
+    if (modelSync.status === "live") {
+      modelSyncStaleWarnedRef.current = false;
+    }
+  }, [modelSync.status]);
+  const handleSyncStateChange = useCallback((sync: ModelSyncState) => {
+    setModelSync(sync);
+  }, []);
+
   // The dashboard keeps ChatPage mounted persistently so the PTY survives tab
   // switches. That is great for ordinary /chat navigation, but it means query
   // param changes do NOT remount the component. Resume-in-chat from the
@@ -164,6 +190,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
+  // Per-session model/provider override — set by ChatSidebar after a
+  // successful /api/model-switch/rebuild triggers a page reload.  Passed
+  // through to the PTY WebSocket URL so the server-side pty_ws handler
+  // spawns the new PTY with the selected runtime.
+  const modelParam = searchParams.get("model");
+  const providerParam = searchParams.get("provider");
   const channel = useMemo(() => generateChannelId(), [resumeParam]);
 
   useEffect(() => {
@@ -278,11 +310,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     if (!host) return;
 
     const token = window.__HERMES_SESSION_TOKEN__;
-    const gated = !!window.__HERMES_AUTH_REQUIRED__;
     // Banner already initialised above; just bail before wiring xterm/WS.
-    // In gated mode the token is absent by design — buildWsAuthParam() mints
-    // a WS ticket instead, so don't bail; let the effect reach that path.
-    if (!token && !gated) {
+    if (!token) {
       return;
     }
 
@@ -567,7 +596,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     void (async () => {
       const authParam = await buildWsAuthParam();
       if (unmounting) return;
-      const url = buildWsUrl(authParam, resumeParam, channel);
+      const url = buildWsUrl(authParam, resumeParam, channel, modelParam, providerParam);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -629,6 +658,36 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (ws.readyState !== WebSocket.OPEN) return;
 
         if (SGR_MOUSE_RE.test(data)) {
+          return;
+        }
+
+        // Guard: when model sync is stale or still switching, warn the
+        // operator on the first Enter so they notice the mismatch — but
+        // then let subsequent Enters through.  The previous dead-end
+        // ``return`` printed an opaque ``MODEL_SELECTION_NOT_APPLIED``
+        // banner and silently swallowed every Enter forever, even though
+        // the runtime model is already authoritative on the PTY side and
+        // the dashboard's "stale" state is a UI-correctness signal, not a
+        // safety condition.  The structured restart-required result from
+        // /api/pty-cmd (see ChatSidebar.onModelSubmit) is the real
+        // actionable surface.
+        if (
+          (data === "\r" || data === "\n") &&
+          modelSyncRef.current.status !== "live" &&
+          !modelSyncStaleWarnedRef.current
+        ) {
+          const sync = modelSyncRef.current;
+          const sel = sync.selectedModel ?? "unknown";
+          const run = sync.runtimeModel ?? "unknown";
+          const msgLine =
+            `\r\n\x1b[33m── model sync: ${sync.status} ──\x1b[0m\r\n` +
+            `  selected (dashboard): ${sel}\r\n` +
+            `  runtime  (PTY agent): ${run}\r\n` +
+            `  next Enter will send to the PTY anyway.\r\n` +
+            `  to switch the runtime: pick a model in the sidebar,\r\n` +
+            `  or type /stop then /model <name> below.\r\n\r\n`;
+          term.write(msgLine);
+          modelSyncStaleWarnedRef.current = true;
           return;
         }
 
@@ -803,7 +862,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} />
+            <ChatSidebar channel={channel} onSyncStateChange={handleSyncStateChange} />
           </div>
         </div>
       </>,
@@ -871,7 +930,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
+              <ChatSidebar channel={channel} onSyncStateChange={handleSyncStateChange} />
             </div>
           </div>
         )}
@@ -884,6 +943,5 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 declare global {
   interface Window {
     __HERMES_SESSION_TOKEN__?: string;
-    __HERMES_AUTH_REQUIRED__?: boolean;
   }
 }

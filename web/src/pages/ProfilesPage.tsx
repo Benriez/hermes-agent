@@ -8,6 +8,7 @@ import {
 import {
   ChevronDown,
   Pencil,
+  Sliders,
   Terminal,
   Trash2,
   Users,
@@ -65,6 +66,335 @@ function ProfilesLoadingSpinner() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// ProfileCard — standalone component with its own model state
+// ---------------------------------------------------------------------------
+
+interface ProfileCardProps {
+  profile: ProfileInfo;
+  renamingFrom: string | null;
+  renameTo: string;
+  setRenamingFrom: (v: string | null) => void;
+  setRenameTo: (v: string) => void;
+  handleRenameSubmit: () => void;
+  editingSoulFor: string | null;
+  openSoulEditor: (name: string) => void;
+  editingModelFor: string | null;
+  openModelEditor: (name: string) => void;
+  soulText: string;
+  setSoulText: (v: string) => void;
+  soulSaving: boolean;
+  handleSaveSoul: (name: string) => void;
+  handleCopyTerminalCommand: (name: string) => void;
+  profileDelete: { requestDelete: (name: string) => void };
+  load: () => void;
+  showToast: (msg: string, type: "success" | "error") => void;
+  t: Record<string, any>;
+}
+
+function ProfileCard({
+  profile: p,
+  renamingFrom,
+  renameTo,
+  setRenamingFrom,
+  setRenameTo,
+  handleRenameSubmit,
+  editingSoulFor,
+  openSoulEditor,
+  editingModelFor,
+  openModelEditor,
+  soulText,
+  setSoulText,
+  soulSaving,
+  handleSaveSoul,
+  handleCopyTerminalCommand,
+  profileDelete,
+  load,
+  showToast,
+  t,
+}: ProfileCardProps) {
+  const isRenaming = renamingFrom === p.name;
+  const isEditingSoul = editingSoulFor === p.name;
+  const isEditingModel = editingModelFor === p.name;
+
+  // Per-profile model editor state
+  const [profileProvider, setProfileProvider] = useState(p.provider ?? "");
+  const [profileModel, setProfileModel] = useState(p.model ?? "");
+  const [profileSaving, setProfileSaving] = useState(false);
+
+  // Keep synced when profiles reload
+  useEffect(() => {
+    setProfileProvider(p.provider ?? "");
+    setProfileModel(p.model ?? "");
+  }, [p.provider, p.model]);
+
+  const handleProfileSaveModel = async () => {
+    setProfileSaving(true);
+    try {
+      const provider = profileProvider.trim() || null;
+      const model = profileModel.trim() || null;
+      await api.updateProfileModel(p.name, model, provider);
+      showToast(`${t.profiles.modelSaved}: ${p.name}`, "success");
+      load();
+    } catch (e) {
+      showToast(`${t.status.error}: ${e}`, "error");
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  return (
+    <Card key={p.name}>
+      <CardContent className="flex items-start gap-4 py-4">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
+            {isRenaming ? (
+              <Input
+                autoFocus
+                value={renameTo}
+                onChange={(e) => setRenameTo(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleRenameSubmit();
+                  if (e.key === "Escape") setRenamingFrom(null);
+                }}
+                aria-invalid={
+                  renameTo.trim() !== "" &&
+                  renameTo.trim() !== p.name &&
+                  !PROFILE_NAME_RE.test(renameTo.trim())
+                }
+                className="max-w-xs"
+              />
+            ) : (
+              <span className="font-medium text-sm truncate">
+                {p.name}
+              </span>
+            )}
+            {p.is_default && (
+              <Badge tone="secondary">{t.profiles.defaultBadge}</Badge>
+            )}
+            {p.has_env && (
+              <Badge tone="outline">{t.profiles.hasEnv}</Badge>
+            )}
+          </div>
+          {isRenaming &&
+            (() => {
+              const trimmed = renameTo.trim();
+              const invalid =
+                trimmed !== "" &&
+                trimmed !== p.name &&
+                !PROFILE_NAME_RE.test(trimmed);
+              return (
+                <p
+                  className={
+                    "text-xs mb-1 " +
+                    (invalid
+                      ? "text-destructive"
+                      : "text-muted-foreground")
+                  }
+                >
+                  {invalid
+                    ? `${t.profiles.invalidName}: ${t.profiles.nameRule}`
+                    : t.profiles.nameRule}
+                </p>
+              );
+            })()}
+          <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap">
+            {p.model && (
+              <span>
+                {t.profiles.model}: {p.model}
+                {p.provider ? ` (${p.provider})` : ""}
+              </span>
+            )}
+            {!p.model && (
+              <span className="text-muted-foreground/60 italic">
+                {t.profiles.model}: —
+              </span>
+            )}
+            <span>
+              {t.profiles.skills}: {p.skill_count}
+            </span>
+            <span className="font-mono truncate max-w-[28rem]">
+              {p.path}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1 shrink-0">
+          {isRenaming ? (
+            <>
+              <Button size="sm" onClick={handleRenameSubmit}>
+                {t.common.save}
+              </Button>
+              <Button
+                size="sm"
+                ghost
+                onClick={() => setRenamingFrom(null)}
+              >
+                {t.common.cancel}
+              </Button>
+            </>
+          ) : (
+            <>
+              <Button
+                ghost
+                size="icon"
+                title={t.profiles.editSoul}
+                aria-label={t.profiles.editSoul}
+                onClick={() => openSoulEditor(p.name)}
+              >
+                {isEditingSoul ? (
+                  <ChevronDown className="h-4 w-4" />
+                ) : (
+                  <span aria-hidden className="text-xs font-bold">
+                    S
+                  </span>
+                )}
+              </Button>
+              <Button
+                ghost
+                size="icon"
+                title="Edit Model"
+                aria-label="Edit Model"
+                onClick={() => openModelEditor(p.name)}
+              >
+                {isEditingModel ? (
+                  <ChevronDown className="h-4 w-4" />
+                ) : (
+                  <Sliders className="h-4 w-4" />
+                )}
+              </Button>
+              <Button
+                ghost
+                size="icon"
+                title={t.profiles.openInTerminal}
+                aria-label={t.profiles.openInTerminal}
+                onClick={() => handleCopyTerminalCommand(p.name)}
+              >
+                <Terminal className="h-4 w-4" />
+              </Button>
+              {!p.is_default && (
+                <Button
+                  ghost
+                  size="icon"
+                  title={t.profiles.rename}
+                  aria-label={t.profiles.rename}
+                  onClick={() => {
+                    setRenamingFrom(p.name);
+                    setRenameTo(p.name);
+                  }}
+                >
+                  <Pencil className="h-4 w-4" />
+                </Button>
+              )}
+              {!p.is_default && (
+                <Button
+                  ghost
+                  size="icon"
+                  title={t.common.delete}
+                  aria-label={t.common.delete}
+                  onClick={() => profileDelete.requestDelete(p.name)}
+                >
+                  <Trash2 className="h-4 w-4 text-destructive" />
+                </Button>
+              )}
+            </>
+          )}
+        </div>
+      </CardContent>
+
+      {/* TOGGLED: Model Configuration section (hidden by default) */}
+      {isEditingModel && (
+        <div className="border-t border-border px-4 pb-4 pt-3 flex flex-col gap-2">
+          <Label className="flex items-center gap-2 font-mondwest text-display text-xs tracking-wider text-muted-foreground">
+            {t.profiles.modelSection}
+          </Label>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="grid gap-1.5">
+              <Label htmlFor={`model-provider-${p.name}`} className="text-xs">
+                {t.profiles.provider}
+              </Label>
+              <input
+                id={`model-provider-${p.name}`}
+                className="flex h-9 w-full border border-input bg-transparent px-3 py-1 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                placeholder={t.profiles.providerPlaceholder}
+                value={profileProvider}
+                onChange={(e) => setProfileProvider(e.target.value)}
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor={`model-name-${p.name}`} className="text-xs">
+                {t.profiles.model}
+              </Label>
+              <input
+                id={`model-name-${p.name}`}
+                className="flex h-9 w-full border border-input bg-transparent px-3 py-1 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                placeholder={t.profiles.modelPlaceholder}
+                value={profileModel}
+                onChange={(e) => setProfileModel(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              className="uppercase"
+              onClick={handleProfileSaveModel}
+              disabled={profileSaving}
+            >
+              {profileSaving ? t.common.saving : t.common.save}
+            </Button>
+            <Button
+              size="sm"
+              ghost
+              onClick={() => {
+                setProfileProvider(p.provider ?? "");
+                setProfileModel(p.model ?? "");
+                openModelEditor(p.name);  // toggle closes
+              }}
+              disabled={profileSaving}
+            >
+              {t.common.cancel}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Collapsible SOUL.md editor */}
+      {isEditingSoul && (
+        <div className="border-t border-border px-4 pb-4 pt-3 flex flex-col gap-2">
+          <Label
+            htmlFor={`soul-editor-${p.name}`}
+            className="flex items-center gap-2 font-mondwest text-display text-xs tracking-wider text-muted-foreground"
+          >
+            {t.profiles.soulSection}
+          </Label>
+          <textarea
+            id={`soul-editor-${p.name}`}
+            className="flex min-h-[180px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            placeholder={t.profiles.soulPlaceholder}
+            value={soulText}
+            onChange={(e) => setSoulText(e.target.value)}
+          />
+          <div>
+            <Button
+              size="sm"
+              className="uppercase"
+              onClick={() => handleSaveSoul(p.name)}
+              disabled={soulSaving}
+            >
+              {soulSaving ? t.common.saving : t.common.save}
+            </Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ProfilesPage
+// ---------------------------------------------------------------------------
+
 export default function ProfilesPage() {
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -94,6 +424,9 @@ export default function ProfilesPage() {
   // Tracks the latest SOUL request so out-of-order responses don't overwrite
   // newer state when the user switches profiles or closes the editor.
   const activeSoulRequest = useRef<string | null>(null);
+
+  // Inline Model editor state
+  const [editingModelFor, setEditingModelFor] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api
@@ -164,6 +497,8 @@ export default function ProfilesPage() {
         setEditingSoulFor(null);
         return;
       }
+      // Mutual exclusion: close model editor when opening soul editor
+      setEditingModelFor(null);
       setEditingSoulFor(name);
       setSoulText("");
       activeSoulRequest.current = name;
@@ -179,6 +514,19 @@ export default function ProfilesPage() {
       }
     },
     [editingSoulFor, showToast, t.status.error],
+  );
+
+  const openModelEditor = useCallback(
+    (name: string) => {
+      // Mutual exclusion: close soul editor when opening model editor
+      if (editingModelFor === name) {
+        setEditingModelFor(null);
+      } else {
+        setEditingSoulFor(null);
+        setEditingModelFor(name);
+      }
+    },
+    [editingModelFor],
   );
 
   const handleSaveSoul = async (name: string) => {
@@ -379,180 +727,30 @@ export default function ProfilesPage() {
           </Card>
         )}
 
-        {profiles.map((p) => {
-          const isRenaming = renamingFrom === p.name;
-          const isEditingSoul = editingSoulFor === p.name;
-          return (
-            <Card key={p.name}>
-              <CardContent className="flex items-start gap-4 py-4">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1 flex-wrap">
-                    {isRenaming ? (
-                      <Input
-                        autoFocus
-                        value={renameTo}
-                        onChange={(e) => setRenameTo(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") handleRenameSubmit();
-                          if (e.key === "Escape") setRenamingFrom(null);
-                        }}
-                        aria-invalid={
-                          renameTo.trim() !== "" &&
-                          renameTo.trim() !== p.name &&
-                          !PROFILE_NAME_RE.test(renameTo.trim())
-                        }
-                        className="max-w-xs"
-                      />
-                    ) : (
-                      <span className="font-medium text-sm truncate">
-                        {p.name}
-                      </span>
-                    )}
-                    {p.is_default && (
-                      <Badge tone="secondary">{t.profiles.defaultBadge}</Badge>
-                    )}
-                    {p.has_env && (
-                      <Badge tone="outline">{t.profiles.hasEnv}</Badge>
-                    )}
-                  </div>
-                  {isRenaming &&
-                    (() => {
-                      const trimmed = renameTo.trim();
-                      const invalid =
-                        trimmed !== "" &&
-                        trimmed !== p.name &&
-                        !PROFILE_NAME_RE.test(trimmed);
-                      return (
-                        <p
-                          className={
-                            "text-xs mb-1 " +
-                            (invalid
-                              ? "text-destructive"
-                              : "text-muted-foreground")
-                          }
-                        >
-                          {invalid
-                            ? `${t.profiles.invalidName}: ${t.profiles.nameRule}`
-                            : t.profiles.nameRule}
-                        </p>
-                      );
-                    })()}
-                  <div className="flex items-center gap-4 text-xs text-muted-foreground flex-wrap">
-                    {p.model && (
-                      <span>
-                        {t.profiles.model}: {p.model}
-                        {p.provider ? ` (${p.provider})` : ""}
-                      </span>
-                    )}
-                    <span>
-                      {t.profiles.skills}: {p.skill_count}
-                    </span>
-                    <span className="font-mono truncate max-w-[28rem]">
-                      {p.path}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-1 shrink-0">
-                  {isRenaming ? (
-                    <>
-                      <Button size="sm" onClick={handleRenameSubmit}>
-                        {t.common.save}
-                      </Button>
-                      <Button
-                        size="sm"
-                        ghost
-                        onClick={() => setRenamingFrom(null)}
-                      >
-                        {t.common.cancel}
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <Button
-                        ghost
-                        size="icon"
-                        title={t.profiles.editSoul}
-                        aria-label={t.profiles.editSoul}
-                        onClick={() => openSoulEditor(p.name)}
-                      >
-                        {isEditingSoul ? (
-                          <ChevronDown className="h-4 w-4" />
-                        ) : (
-                          <span aria-hidden className="text-xs font-bold">
-                            S
-                          </span>
-                        )}
-                      </Button>
-                      <Button
-                        ghost
-                        size="icon"
-                        title={t.profiles.openInTerminal}
-                        aria-label={t.profiles.openInTerminal}
-                        onClick={() => handleCopyTerminalCommand(p.name)}
-                      >
-                        <Terminal className="h-4 w-4" />
-                      </Button>
-                      {!p.is_default && (
-                        <Button
-                          ghost
-                          size="icon"
-                          title={t.profiles.rename}
-                          aria-label={t.profiles.rename}
-                          onClick={() => {
-                            setRenamingFrom(p.name);
-                            setRenameTo(p.name);
-                          }}
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                      )}
-                      {!p.is_default && (
-                        <Button
-                          ghost
-                          size="icon"
-                          title={t.common.delete}
-                          aria-label={t.common.delete}
-                          onClick={() => profileDelete.requestDelete(p.name)}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </Button>
-                      )}
-                    </>
-                  )}
-                </div>
-              </CardContent>
-
-              {isEditingSoul && (
-                <div className="border-t border-border px-4 pb-4 pt-3 flex flex-col gap-2">
-                  <Label
-                    htmlFor={`soul-editor-${p.name}`}
-                    className="flex items-center gap-2 font-mondwest text-display text-xs tracking-wider text-muted-foreground"
-                  >
-                    {t.profiles.soulSection}
-                  </Label>
-                  <textarea
-                    id={`soul-editor-${p.name}`}
-                    className="flex min-h-[180px] w-full border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    placeholder={t.profiles.soulPlaceholder}
-                    value={soulText}
-                    onChange={(e) => setSoulText(e.target.value)}
-                  />
-                  <div>
-                    <Button
-                      size="sm"
-                      className="uppercase"
-                      onClick={() => handleSaveSoul(p.name)}
-                      disabled={soulSaving}
-                    >
-                      {soulSaving ? t.common.saving : t.common.save}
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </Card>
-          );
-        })}
+        {profiles.map((p) => (
+          <ProfileCard
+            key={p.name}
+            profile={p}
+            renamingFrom={renamingFrom}
+            renameTo={renameTo}
+            setRenamingFrom={setRenamingFrom}
+            setRenameTo={setRenameTo}
+            handleRenameSubmit={handleRenameSubmit}
+            editingSoulFor={editingSoulFor}
+            openSoulEditor={openSoulEditor}
+            editingModelFor={editingModelFor}
+            openModelEditor={openModelEditor}
+            soulText={soulText}
+            setSoulText={setSoulText}
+            soulSaving={soulSaving}
+            handleSaveSoul={handleSaveSoul}
+            handleCopyTerminalCommand={handleCopyTerminalCommand}
+            profileDelete={profileDelete}
+            load={load}
+            showToast={showToast}
+            t={t}
+          />
+        ))}
       </div>
     </div>
   );

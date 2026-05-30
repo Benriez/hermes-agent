@@ -133,6 +133,15 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    _inherited_flag(
+        parser,
+        "--base-url",
+        default=None,
+        help=(
+            "Base URL override for this invocation. "
+            "Applies to -z/--oneshot and --tui."
+        ),
+    )
     parser.add_argument(
         "-t",
         "--toolsets",
@@ -267,6 +276,12 @@ def build_top_level_parser():
         # `--provider` flag.
         default=None,
         help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--base-url",
+        default=None,
+        help="Base URL override for this session.",
     )
     chat_parser.add_argument(
         "-v",

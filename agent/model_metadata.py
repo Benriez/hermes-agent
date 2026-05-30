@@ -127,6 +127,114 @@ CONTEXT_PROBE_TIERS = [
 # Default context length when no detection method succeeds.
 DEFAULT_FALLBACK_CONTEXT = CONTEXT_PROBE_TIERS[0]
 
+# ---------------------------------------------------------------------------
+# Local / custom / pi-4 model-id context parsing.
+#
+# Local model ids (e.g. served by llama-swap / llama.cpp / pi-4 endpoints)
+# routinely encode the loaded context window in the model id itself:
+#   gemma-26b-a4b-64k, qwen-35b-a3b-128k-mtp, qwopus-27b-mtp-64k, ...
+# The model id is therefore the most authoritative source of truth for
+# local models.  When the local /models probe fails or returns no usable
+# value, Hermes previously fell through to ``DEFAULT_FALLBACK_CONTEXT``
+# (256K) — far too large for these small local servers, which then
+# blow up on the first long request.  We now parse the suffix first and
+# fall back to a conservative 64K local default when no suffix is present.
+# Cloud providers are explicitly excluded — they keep their existing
+# automatic/provider-metadata behavior.
+# ---------------------------------------------------------------------------
+
+# Accepted local context suffix values (in thousands).
+_LOCAL_CONTEXT_ACCEPTED_K: frozenset[int] = frozenset({8, 16, 32, 64, 128, 192, 256})
+
+# Conservative fallback for local models whose id has no parseable suffix.
+LOCAL_UNKNOWN_FALLBACK_CONTEXT: int = 65_536
+
+# Match an explicit context marker like ``-64k`` / ``_128k_`` / ``-256k`` but
+# NOT model-size markers like ``26b`` or ``3n``.  The leading and trailing
+# separator constraints prevent matching version/parameter fragments such as
+# ``gpt-5.5``, ``kimi-k2.6``, ``a4b`` or ``e4b``.
+_LOCAL_CONTEXT_SUFFIX_RE = re.compile(r"(?:^|[-_])(\d{1,3})k(?:$|[-_])", re.IGNORECASE)
+
+# Cloud / hosted providers that must NEVER be parsed via the local model-id
+# suffix path — their context windows are determined by provider metadata
+# and may differ from anything the model name suggests.
+_CLOUD_PROVIDERS_SKIP_LOCAL_PARSER: frozenset[str] = frozenset({
+    "deepseek", "nvidia", "openai-codex", "copilot", "copilot-acp",
+    "github-copilot", "github-models", "minimax", "minimax-oauth",
+    "minimax-cn", "opencode-go", "opencode", "openai", "anthropic",
+    "openrouter", "novita", "nous", "xai", "xai-oauth", "grok",
+    "gemini", "google", "google-gemini", "google-ai-studio",
+    "alibaba", "qwen-oauth", "qwen-portal", "kimi-coding",
+    "kimi-coding-cn", "moonshot", "moonshot-cn", "zai", "z-ai",
+    "stepfun", "arcee", "arcee-ai", "ollama-cloud", "fireworks",
+    "xiaomi", "xiaomi-mimo", "gmi", "gmi-cloud", "tencent-tokenhub",
+    "tencent", "tencent-cloud", "tencentmaas", "bedrock", "vercel",
+    "ai-gateway", "kilocode",
+})
+
+# Provider names that explicitly identify a local/custom/pi-4 endpoint even
+# when the base_url itself isn't recognisable (e.g. socket-only servers).
+_LOCAL_PROVIDER_HINTS: frozenset[str] = frozenset({
+    "custom", "pi-4", "pi4", "local", "llama-swap", "llama-cpp",
+    "llamacpp", "lmstudio", "ollama",
+})
+
+
+def parse_context_from_local_model_id(model_id: Any) -> Optional[int]:
+    """Extract an explicit context suffix from a local model id.
+
+    Returns the context length in tokens (suffix_k * 1024) when the model
+    id encodes a valid context window, otherwise ``None``.
+
+    Examples
+    --------
+    >>> parse_context_from_local_model_id("gemma-26b-a4b-64k")
+    65536
+    >>> parse_context_from_local_model_id("qwen-35b-a3b-128k-mtp")
+    131072
+    >>> parse_context_from_local_model_id("gemma-26b-a4b")  # no suffix
+    >>> parse_context_from_local_model_id("gpt-5.5")        # no suffix
+    """
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    # Iterate all matches so unrelated digit-k fragments (none exist in the
+    # documented local naming scheme today) couldn't shadow a valid suffix.
+    last_match: Optional[int] = None
+    for match in _LOCAL_CONTEXT_SUFFIX_RE.finditer(model_id):
+        try:
+            value_k = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if value_k in _LOCAL_CONTEXT_ACCEPTED_K:
+            last_match = value_k
+        else:
+            logger.warning(
+                "Local model id %r contains context suffix '%dk' not in accepted set %s; "
+                "ignoring and falling back to provider policy.",
+                model_id, value_k, sorted(_LOCAL_CONTEXT_ACCEPTED_K),
+            )
+    if last_match is None:
+        return None
+    return last_match * 1024
+
+
+def _is_local_model_context(provider: str, base_url: str) -> bool:
+    """Return True when context detection should treat this as a local model.
+
+    Cloud providers are explicitly excluded regardless of base_url so a
+    misconfigured base_url cannot cause cloud providers to silently switch
+    to the local fallback policy.
+    """
+    if provider:
+        prov_lower = provider.strip().lower()
+        if prov_lower in _CLOUD_PROVIDERS_SKIP_LOCAL_PARSER:
+            return False
+        if prov_lower in _LOCAL_PROVIDER_HINTS:
+            return True
+    if base_url and is_local_endpoint(base_url):
+        return True
+    return False
+
 # Minimum context length required to run Hermes Agent.  Models with fewer
 # tokens cannot maintain enough working memory for tool-calling workflows.
 # Sessions, model switches, and cron jobs should reject models below this.
@@ -1507,6 +1615,21 @@ def get_model_context_length(
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
     model = _strip_provider_prefix(model)
 
+    # 0c. Local model id suffix is authoritative for local/custom/pi-4
+    # endpoints ONLY.  Local model ids encode the loaded context window
+    # (e.g. ``gemma-26b-a4b-64k`` → 65536) and that is more trustworthy
+    # than any /models probe, cache entry or guessed default.  Cloud
+    # providers are excluded — their context is provider-controlled and
+    # must never be parsed via the local suffix regex.
+    if _is_local_model_context(provider, base_url):
+        _local_id_ctx = parse_context_from_local_model_id(model)
+        if _local_id_ctx is not None:
+            logger.debug(
+                "Local model context resolved from id suffix: model=%r ctx=%s",
+                model, f"{_local_id_ctx:,}",
+            )
+            return _local_id_ctx
+
     # 1. Check persistent cache (model+provider)
     # LM Studio is excluded — its loaded context length is transient (the
     # user can reload the model with a different context_length at any time
@@ -1603,6 +1726,18 @@ def get_model_context_length(
                     if provider != "lmstudio":
                         save_context_length(model, base_url, local_ctx)
                     return local_ctx
+                # Local endpoint with no parseable model-id suffix (already
+                # tried at step 0c) and no live probe result.  Use the
+                # conservative local fallback instead of the 256K cloud
+                # default — small local servers cannot survive 256K
+                # requests and would OOM/crash on first long turn.
+                logger.info(
+                    "Could not detect local model context from metadata or model id; "
+                    "defaulting local context to %s tokens. Set model.context_length "
+                    "in config.yaml to override.",
+                    f"{LOCAL_UNKNOWN_FALLBACK_CONTEXT:,}",
+                )
+                return LOCAL_UNKNOWN_FALLBACK_CONTEXT
             logger.info(
                 "Could not detect context length for model %r at %s — "
                 "defaulting to %s tokens (probe-down). Set model.context_length "
@@ -1733,6 +1868,16 @@ def get_model_context_length(
             if provider != "lmstudio":
                 save_context_length(model, base_url, local_ctx)
             return local_ctx
+
+    # 9b. Local endpoint final fallback — keep cloud default (256K) for
+    # cloud providers but never apply it to local/custom/pi-4 endpoints.
+    if _is_local_model_context(provider, base_url):
+        logger.info(
+            "Local model %r at %s has no detectable context and no id suffix; "
+            "defaulting local context to %s tokens.",
+            model, base_url or "<no-url>", f"{LOCAL_UNKNOWN_FALLBACK_CONTEXT:,}",
+        )
+        return LOCAL_UNKNOWN_FALLBACK_CONTEXT
 
     # 10. Default fallback — 256K
     return DEFAULT_FALLBACK_CONTEXT

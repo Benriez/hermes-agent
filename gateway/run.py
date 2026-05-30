@@ -1396,6 +1396,89 @@ def _check_unavailable_skill(command_name: str) -> str | None:
     return None
 
 
+# ---------- Bike Mode voice auto-routing helpers ----------
+
+_BIKE_STATE_PATH = Path("/home/flashback/.hermes/bike/state.json")
+_VOICE_INPUT_SCRIPT = Path(
+    "/home/flashback/.hermes/custom-skills/voice-input/scripts/voice_input.py"
+)
+_VOICE_TRANSCRIPT_RE = re.compile(
+    r'\[The user sent a voice message~ Here\'s what they said: "(?P<t>.*?)"\]',
+    re.DOTALL,
+)
+
+
+def _bike_mode_is_active() -> bool:
+    """Return True when ~/.hermes/bike/state.json reports bikeMode=True."""
+    try:
+        if not _BIKE_STATE_PATH.exists():
+            return False
+        data = json.loads(_BIKE_STATE_PATH.read_text(encoding="utf-8"))
+        return bool(data.get("bikeMode"))
+    except Exception:
+        return False
+
+
+def _extract_voice_transcript(message_text: str) -> "str | None":
+    """Pull the transcript out of the gateway's voice-enrichment marker."""
+    if not message_text:
+        return None
+    m = _VOICE_TRANSCRIPT_RE.search(message_text)
+    if not m:
+        return None
+    transcript = (m.group("t") or "").strip()
+    return transcript or None
+
+
+async def _route_voice_transcript_to_bike_mode(
+    transcript: str,
+    *,
+    chat_id: "str | None" = None,
+    message_id: "str | None" = None,
+) -> str:
+    """Run voice_input.py route-text and return a short Telegram reply.
+
+    Never raises. On failure returns a short error string suitable for the
+    user. Only invokes a known local script with fixed argv -- no shell.
+    """
+    transcript = (transcript or "").strip()
+    preview = transcript[:180] + ("\u2026" if len(transcript) > 180 else "")
+    if not transcript:
+        return "\U0001f3a7 Bike Mode voice routing failed: empty transcript."
+    if not _VOICE_INPUT_SCRIPT.exists():
+        return "\U0001f3a7 Bike Mode voice routing failed: voice_input script missing."
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", str(_VOICE_INPUT_SCRIPT),
+            "route-text", transcript, "--source", "telegram",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return "\U0001f3a7 Bike Mode\nHeard: \"" + preview + "\"\nResult: timeout"
+    except Exception as exc:
+        return "\U0001f3a7 Bike Mode voice routing failed: " + type(exc).__name__
+    out = (stdout or b"").decode("utf-8", "replace").strip()
+    err = (stderr or b"").decode("utf-8", "replace").strip()
+    short = None
+    try:
+        data = json.loads(out)
+        short = data.get("short") or (data.get("bikeResult") or {}).get("short")
+    except Exception:
+        short = None
+    if not short:
+        snippet = (out or err or "no output")[-160:]
+        return "\U0001f3a7 Bike Mode voice routing failed: " + snippet
+    return "\U0001f3a7 Bike Mode\nHeard: \"" + preview + "\"\nResult: " + short
+
+
+
 def _platform_config_key(platform: "Platform") -> str:
     """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
     return "cli" if platform == Platform.LOCAL else platform.value
@@ -5701,18 +5784,50 @@ class GatewayRunner:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
+        def _dispatchable_ready_summary() -> dict:
+            """Return a per-tick snapshot of the ready queue split by
+            whether the dispatcher could actually spawn a worker for it.
 
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
+            ``dispatchable`` counts ready+assigned+unclaimed tasks whose
+            assignee maps to a real Hermes profile AND that are not
+            policy-blocked, controller-pending, quarantined, or
+            unresolvable-skill-flagged. ``excluded`` breaks the rest
+            down by reason for the watchdog log message.
+
+            Replacement for the prior ``_ready_nonempty`` boolean probe,
+            which counted policy-held cards and triggered spurious
+            "dispatcher stuck" warnings on a board that was correctly
+            idle by design (e.g. controller_first workflow holding 17+
+            planner cards waiting for projects-autonomous-runner). See
+            TASK-093.
             """
+            try:
+                from hermes_cli.kanban_db import (
+                    _result_blocks_repromotion,
+                    _task_is_policy_blocked_issue_card,
+                )
+            except Exception:
+                _result_blocks_repromotion = None  # type: ignore[assignment]
+                _task_is_policy_blocked_issue_card = None  # type: ignore[assignment]
+            try:
+                from hermes_cli.kanban_diagnostics import (
+                    _result_is_controller_pending,
+                )
+            except Exception:
+                _result_is_controller_pending = None  # type: ignore[assignment]
+            try:
+                from hermes_cli.profiles import profile_exists
+            except Exception:
+                profile_exists = None  # type: ignore[assignment]
+
+            dispatchable = 0
+            excluded = {
+                "unassigned": 0,
+                "non_hermes_profile": 0,
+                "policy_blocked_issue_card": 0,
+                "controller_pending": 0,
+                "result_quarantine_flag": 0,
+            }
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
@@ -5722,10 +5837,48 @@ class GatewayRunner:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
+                    rows = conn.execute(
+                        "SELECT id, assignee, result FROM tasks "
+                        "WHERE status = 'ready' AND claim_lock IS NULL"
+                    ).fetchall()
+                    for row in rows:
+                        rid = row["id"] if hasattr(row, "keys") else row[0]
+                        assignee = row["assignee"] if hasattr(row, "keys") else row[1]
+                        result_json = row["result"] if hasattr(row, "keys") else row[2]
+                        if not assignee:
+                            excluded["unassigned"] += 1
+                            continue
+                        if profile_exists is not None and not profile_exists(assignee):
+                            excluded["non_hermes_profile"] += 1
+                            continue
+                        if (
+                            _task_is_policy_blocked_issue_card is not None
+                            and _task_is_policy_blocked_issue_card(rid)
+                        ):
+                            excluded["policy_blocked_issue_card"] += 1
+                            continue
+                        # Reuse the diagnostics helper if available; fall
+                        # back to inline JSON parse if not (older trees).
+                        cp_flag = False
+                        if _result_is_controller_pending is not None:
+                            try:
+                                class _Stub:
+                                    pass
+                                stub = _Stub()
+                                stub.result = result_json  # type: ignore[attr-defined]
+                                cp_flag = bool(_result_is_controller_pending(stub))
+                            except Exception:
+                                cp_flag = False
+                        if cp_flag:
+                            excluded["controller_pending"] += 1
+                            continue
+                        if (
+                            _result_blocks_repromotion is not None
+                            and _result_blocks_repromotion(result_json)
+                        ):
+                            excluded["result_quarantine_flag"] += 1
+                            continue
+                        dispatchable += 1
                 except Exception:
                     continue
                 finally:
@@ -5734,7 +5887,14 @@ class GatewayRunner:
                             conn.close()
                         except Exception:
                             pass
-            return False
+            return {"dispatchable": dispatchable, "excluded": excluded}
+
+        def _ready_nonempty() -> bool:
+            """Back-compat boolean probe — kept for any out-of-tree call
+            sites. The watchdog itself now uses
+            :func:`_dispatchable_ready_summary`. (TASK-093 retained for
+            safety.)"""
+            return _dispatchable_ready_summary()["dispatchable"] > 0
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -5868,20 +6028,34 @@ class GatewayRunner:
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
                 # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                ready_summary = await asyncio.to_thread(
+                    _dispatchable_ready_summary
+                )
+                dispatchable = int(ready_summary.get("dispatchable", 0))
+                excluded = ready_summary.get("excluded", {}) or {}
+                # Policy-aware staleness gate (TASK-093): only count
+                # ticks where the queue contains a card the dispatcher
+                # could ACTUALLY spawn. Controller-pending cards,
+                # policy-blocked issue cards, quarantine-flagged rows,
+                # and non-Hermes-profile assignees are NOT "stuck" —
+                # they are correctly idle by design.
+                if dispatchable > 0 and not any_spawned:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
+                        excl_str = ", ".join(
+                            f"{k}={v}" for k, v in sorted(excluded.items()) if v
+                        ) or "none"
                         logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
-                            "`hermes kanban list --status ready`.",
-                            bad_ticks,
+                            "kanban dispatcher stuck: %d dispatchable ready "
+                            "card(s) for %d consecutive ticks but 0 workers "
+                            "spawned. excluded=[%s]. Check profile health "
+                            "(venv, PATH, credentials) and `hermes kanban list "
+                            "--status ready`.",
+                            dispatchable, bad_ticks, excl_str,
                         )
                         last_warn_at = now
             except asyncio.CancelledError:
@@ -7480,6 +7654,8 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "doctor":
+                    return await self._handle_doctor_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -7736,6 +7912,9 @@ class GatewayRunner:
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
+
+        if canonical == "doctor":
+            return await self._handle_doctor_command(event)
 
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
@@ -8202,7 +8381,40 @@ class GatewayRunner:
                     "can't listen",
                     "VOICE_TOOLS_OPENAI_KEY",
                 )
-                if any(marker in message_text for marker in _stt_fail_markers):
+    
+            # ---- Bike Mode auto-routing for Telegram voice ----
+            if (
+                event.message_type == MessageType.VOICE
+                and _bike_mode_is_active()
+            ):
+                _bike_transcript = _extract_voice_transcript(message_text)
+                if _bike_transcript:
+                    _bike_reply = await _route_voice_transcript_to_bike_mode(
+                        _bike_transcript,
+                        chat_id=getattr(source, "chat_id", None),
+                        message_id=getattr(event, "message_id", None),
+                    )
+                    _bike_adapter = self.adapters.get(source.platform)
+                    if _bike_adapter:
+                        try:
+                            _bike_meta = (
+                                {"thread_id": source.thread_id}
+                                if getattr(source, "thread_id", None) else None
+                            )
+                            await _bike_adapter.send(
+                                source.chat_id,
+                                _bike_reply,
+                                metadata=_bike_meta,
+                            )
+                        except Exception as _bike_send_exc:
+                            logger.warning(
+                                "Bike Mode voice reply send failed: %s",
+                                _bike_send_exc,
+                            )
+                    return None
+            # ---- end Bike Mode auto-routing ----
+
+            if any(marker in message_text for marker in _stt_fail_markers):
                     _stt_adapter = self.adapters.get(source.platform)
                     _stt_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _stt_adapter:
@@ -9730,17 +9942,635 @@ class GatewayRunner:
         return EphemeralReply(f"{header}{_tip_line}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show active profile name and home directory."""
+        """Handle /profile — show active profile info.
+
+        Supports subcommands:
+          /profile           — show profile name and home directory
+          /profile status    — show extended profile status with model/provider info
+
+        Checks the session override first (set by /profile <name> or
+        Telegram profile-router), then falls back to the CLI-level
+        get_active_profile_name() (which always returns "default"
+        in gateway context), then "default" as a last resort.
+        """
         from hermes_constants import display_hermes_home
         from hermes_cli.profiles import get_active_profile_name
 
         display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        source = event.source
+        session_key = self._session_key_for_source(source) if source else None
+        override = self._session_model_overrides.get(session_key or "", {})
+        override_name = override.get("profile_name")
+        profile_name = override_name or get_active_profile_name() or "default"
 
+        # Parse subcommand from event args
+        raw_args = event.get_command_args().strip().lower()
+
+        # Log entry for /profile status routing tracing
+        first_line = event.text.split("\n")[0].strip() if event.text else ""
+        logger.info(
+            "PROFILE_STATUS_COMMAND stage=entry "
+            "message_id=%s raw_first_line=%s",
+            getattr(event, "message_id", ""), first_line,
+        )
+
+        if raw_args and raw_args != "status":
+            requested_profile = raw_args.split(None, 1)[0]
+            try:
+                from gateway.telegram_orchestrator_routing import (
+                    load_profile_model_config,
+                    resolve_profile_name,
+                )
+            except Exception as exc:
+                logger.warning("/profile profile switch unavailable: %s", exc)
+                return (
+                    "BLOCKED_ROUTING_CONTEXT\n"
+                    f"requested_profile: {requested_profile}\n"
+                    "reason: profile helper unavailable"
+                )
+
+            resolution = resolve_profile_name(requested_profile)
+            status = str(resolution.get("status") or "").strip().lower()
+            if status in {"default", "reset"}:
+                if session_key:
+                    self._session_model_overrides.pop(session_key, None)
+                    try:
+                        self._evict_cached_agent(session_key)
+                    except Exception:
+                        pass
+                return (
+                    "PROFILE_ACTIVATED\n"
+                    "Profile switched: default\n"
+                    "active_profile: default\n"
+                    "override_present: false"
+                )
+            if status not in {"ok", "found"}:
+                normalized = resolution.get("normalized") or requested_profile
+                available = resolution.get("available") or []
+                available_block = "\n".join(f"  - {name}" for name in available) if available else "  (none discovered)"
+                return (
+                    "PROFILE_NOT_FOUND\n"
+                    f"requested_profile: {requested_profile}\n"
+                    f"normalized_profile: {normalized}\n"
+                    "available_profiles:\n"
+                    f"{available_block}"
+                )
+
+            canonical_profile = resolution.get("canonical") or resolution.get("canonical_name") or requested_profile
+            model_config = load_profile_model_config(canonical_profile)
+            if not model_config:
+                return (
+                    "PROFILE_NOT_FOUND\n"
+                    f"requested_profile: {requested_profile}\n"
+                    f"normalized_profile: {canonical_profile}\n"
+                    "reason: profile config not readable"
+                )
+            override = {
+                "model": model_config.get("model"),
+                "provider": model_config.get("provider"),
+                "base_url": model_config.get("base_url"),
+                "api_mode": model_config.get("api_mode"),
+                "api_key": model_config.get("api_key", ""),
+                "disabled_toolsets": model_config.get("disabled_toolsets", []),
+                "profile_name": canonical_profile,
+                "routing_intent": "profile_command",
+                "explicit": True,
+                "source": "telegram:/profile",
+            }
+            if "toolsets" in model_config:
+                override["toolsets"] = model_config["toolsets"]
+            if "fallback_providers" in model_config:
+                override["fallback_providers"] = model_config["fallback_providers"]
+            if session_key:
+                self._session_model_overrides[session_key] = override
+                try:
+                    self._evict_cached_agent(session_key)
+                except Exception:
+                    pass
+            return (
+                "PROFILE_ACTIVATED\n"
+                f"Profile switched: {canonical_profile}\n"
+                f"active_profile: {canonical_profile}\n"
+                "override_present: true\n"
+                "override_source: telegram:/profile\n"
+                f"model: {override.get('model') or 'unknown'}\n"
+                f"provider: {override.get('provider') or 'unknown'}"
+            )
+
+        if raw_args == "status":
+            # Log system command detection
+            logger.info(
+                "PROFILE_STATUS_COMMAND stage=system_command_detected "
+                "message_id=%s subcommand=status",
+                getattr(event, "message_id", ""),
+            )
+            # Extended status output
+            # Resolve effective model/provider from session override first,
+            # then fall back to the actual runtime config (the same resolution
+            # used by the gateway startup status line and agent creation).
+            # getattr(self, "_model") does NOT exist on GatewayRunner — it was
+            # always returning "" as the fallback, producing blank fields.
+            _config_model = _resolve_gateway_model(
+                self.config if isinstance(self.config, dict) else None
+            )
+            # Resolve provider: read from config.yaml model.provider (single
+            # source of truth), same as resolve_runtime_provider() uses.
+            _config_provider = ""
+            try:
+                if isinstance(self.config, dict):
+                    _model_cfg = self.config.get("model", {})
+                    if isinstance(_model_cfg, dict):
+                        _config_provider = _model_cfg.get("provider") or ""
+                else:
+                    # GatewayConfig dataclass — read model section via
+                    # _load_gateway_config() which returns a dict.
+                    _raw_cfg = _load_gateway_config()
+                    _model_cfg = _raw_cfg.get("model", {})
+                    if isinstance(_model_cfg, dict):
+                        _config_provider = _model_cfg.get("provider") or ""
+            except Exception:
+                pass
+            effective_model = override.get("model") or _config_model or "unknown"
+            effective_provider = override.get("provider") or _config_provider or "unknown"
+            api_mode = override.get("api_mode") or "chat_completions"
+            override_present = bool(session_key and session_key in self._session_model_overrides)
+            override_source = str(override.get("source") or "session (/profile or /model)") if override_present else "none"
+
+            # Check cached agent
+            cached_agent_present = False
+            try:
+                _cache = getattr(self, "_agent_cache", None)
+                if _cache and session_key and session_key in _cache:
+                    _entry = _cache[session_key]
+                    if isinstance(_entry, tuple) and len(_entry) > 0 and _entry[0] is not None:
+                        cached_agent_present = True
+            except Exception:
+                pass
+
+            lines = [
+                "PROFILE_STATUS",
+                f"active_profile: {profile_name}",
+                f"effective_model: {effective_model}",
+                f"effective_provider: {effective_provider}",
+                f"api_mode: {api_mode}",
+                f"override_present: {'true' if override_present else 'false'}",
+                f"override_source: {override_source}",
+                f"session_key: {session_key or ''}",
+                f"cached_agent_present: {'true' if cached_agent_present else 'false'}",
+            ]
+            response_text = "\n".join(lines)
+            logger.info(
+                "PROFILE_STATUS_COMMAND stage=system_response_returned "
+                "message_id=%s response_prefix=PROFILE_STATUS terminal=true",
+                getattr(event, "message_id", ""),
+            )
+            return response_text
+
+        # Default: show brief profile info (original behavior)
         lines = [
             t("gateway.profile.header", profile=profile_name),
             t("gateway.profile.home", home=display),
         ]
+        # Report whether the profile comes from session override or CLI default
+        if session_key and session_key in self._session_model_overrides:
+            lines.append("session_override_active: true")
+        else:
+            lines.append("session_override_active: false")
+
+        return "\n".join(lines)
+
+
+    async def _handle_doctor_command(self, event: MessageEvent) -> str:
+        """Handle /doctor — run a system-side health check.
+
+        Returns a structured HERMES_DOCTOR_REPORT without calling any
+        LLM, skill, or profile dispatch.  No tokens or secrets are
+        included in the output.
+        """
+        import os
+        import subprocess
+        from pathlib import Path
+
+        hermes_home = Path(os.path.expanduser("~/.hermes"))
+        logs_dir = hermes_home / "logs"
+        profiles_dir = hermes_home / "profiles"
+
+        # ── Runtime (reuse _handle_profile_command logic) ───────────
+        from hermes_cli.profiles import get_active_profile_name
+        source = event.source
+        session_key = self._session_key_for_source(source) if source else None
+        override = self._session_model_overrides.get(session_key or "", {})
+        profile_name = override.get("profile_name") or get_active_profile_name() or "default"
+        _config_model = _resolve_gateway_model(
+            self.config if isinstance(self.config, dict) else None
+        )
+        _config_provider = ""
+        try:
+            if isinstance(self.config, dict):
+                _mc = self.config.get("model", {})
+                if isinstance(_mc, dict):
+                    _config_provider = _mc.get("provider") or ""
+            else:
+                _raw = _load_gateway_config()
+                _mc = _raw.get("model", {})
+                if isinstance(_mc, dict):
+                    _config_provider = _mc.get("provider") or ""
+        except Exception:
+            pass
+        effective_model = override.get("model") or _config_model or "unknown"
+        effective_provider = override.get("provider") or _config_provider or "unknown"
+        api_mode = override.get("api_mode") or "chat_completions"
+        override_present = bool(session_key and session_key in self._session_model_overrides)
+        cached_agent_present = False
+        try:
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache and session_key and session_key in _cache:
+                _entry = _cache[session_key]
+                if isinstance(_entry, tuple) and len(_entry) > 0 and _entry[0] is not None:
+                    cached_agent_present = True
+        except Exception:
+            pass
+
+        # ── Services ──────────────────────────────────────────────
+        gateway_status = "unknown"
+        gateway_pid = "unknown"
+        duplicate_processes = "unknown"
+        try:
+            cp = subprocess.run(
+                ["systemctl", "--user", "is-active", "hermes-gateway.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            gateway_status = cp.stdout.strip() if cp.returncode == 0 else "inactive"
+        except Exception:
+            pass
+        try:
+            cp = subprocess.run(
+                ["systemctl", "--user", "show", "-p", "MainPID",
+                 "hermes-gateway.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if cp.returncode == 0:
+                for line in cp.stdout.strip().splitlines():
+                    if line.startswith("MainPID="):
+                        gateway_pid = line.split("=", 1)[1]
+        except Exception:
+            pass
+        try:
+            cp = subprocess.run(
+                ["pgrep", "-cu", str(os.getuid()),
+                 "-f", "hermes.*gateway|gateway.*hermes|telegram.*bot"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if cp.returncode == 0:
+                count = len(cp.stdout.strip().splitlines())
+                duplicate_processes = "true" if count > 1 else "false"
+        except Exception:
+            pass
+
+        # ── Profiles ─────────────────────────────────────────────
+        profile_count = "unknown"
+        profile_check_status = "unknown"
+        profiles_ok = profiles_warn = profiles_fail = "unknown"
+        zero_skill = "unknown"
+        dash_mismatch = "unknown"
+        if profiles_dir.is_dir():
+            try:
+                profile_count = str(len([
+                    d for d in profiles_dir.iterdir()
+                    if d.is_dir() and (d / "config.yaml").exists()
+                ]))
+            except Exception:
+                pass
+        profile_check_bin = hermes_home / "bin" / "hermes-profile-check"
+        if profile_check_bin.exists():
+            try:
+                cp = subprocess.run(
+                    [str(profile_check_bin)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                output = cp.stdout.strip()
+                # Extract structured fields from profile-check output
+                for line in output.splitlines():
+                    lower = line.lower()
+                    if "zero_effective_skill_profiles" in lower:
+                        zero_skill = line.split(":", 1)[-1].strip()
+                    elif "dashboard_mismatch" in lower:
+                        dash_mismatch = line.split(":", 1)[-1].strip()
+                    elif "profiles_ok" in lower:
+                        profiles_ok = line.split(":", 1)[-1].strip()
+                    elif "profiles_warn" in lower:
+                        profiles_warn = line.split(":", 1)[-1].strip()
+                    elif "profiles_fail" in lower:
+                        profiles_fail = line.split(":", 1)[-1].strip()
+                    elif "status:" in lower or "profile_check_status" in lower:
+                        profile_check_status = line.split(":", 1)[-1].strip()
+            except Exception:
+                profile_check_status = "error"
+
+        # ── Provider sanity ───────────────────────────────────────
+        opencode_base_ok = "true"
+        opencode_bad_profiles: list[str] = []
+        opencode_bad_count = 0
+        for go_prof in ["go-auditor", "go-architect", "go-implementer",
+                         "go-knowledge-maintainer", "go-orchestrator",
+                         "go-planner", "go-reviewer"]:
+            cfg = profiles_dir / go_prof / "config.yaml"
+            if not cfg.exists():
+                continue
+            try:
+                content = cfg.read_text()
+                # Only check the model: section — skip fallback/auxiliary
+                in_model = False
+                model_base_url = ""
+                model_provider = ""
+                for line in content.splitlines():
+                    stripped = line.strip()
+                    if stripped == "model:":
+                        in_model = True
+                        continue
+                    if in_model and not line.startswith(" ") and not line.startswith("\t"):
+                        # Left the model: section
+                        break
+                    if in_model:
+                        if stripped.startswith("provider:"):
+                            model_provider = stripped.split(":", 1)[1].strip()
+                        if stripped.startswith("base_url:"):
+                            model_base_url = stripped.split(":", 1)[1].strip()
+                # Only flag if provider is opencode-go AND base_url is
+                # missing/empty/wrong in the model section.
+                if model_provider == "opencode-go":
+                    if not model_base_url or model_base_url in ("''", '""', ""):
+                        opencode_base_ok = "false"
+                        opencode_bad_profiles.append(go_prof)
+                        opencode_bad_count += 1
+            except Exception:
+                pass
+        if not opencode_bad_profiles:
+            opencode_bad_count = 0
+
+        # ── Gateway start time for error scoping ──────────────────
+        gateway_start_epoch: float = 0.0
+        try:
+            cp = subprocess.run(
+                ["systemctl", "--user", "show", "-p", "ActiveEnterTimestamp",
+                 "hermes-gateway.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if cp.returncode == 0:
+                for line in cp.stdout.strip().splitlines():
+                    if line.startswith("ActiveEnterTimestamp="):
+                        ts_str = line.split("=", 1)[1].strip()
+                        # "Fri 2026-05-29 15:51:53 CEST"
+                        # Strip day-of-week prefix and timezone suffix
+                        parts = ts_str.split()
+                        if len(parts) >= 3:
+                            date_part = parts[1]  # "2026-05-29"
+                            time_part = parts[2]  # "15:51:53"
+                            from datetime import datetime
+                            dt = datetime.strptime(
+                                f"{date_part} {time_part}", "%Y-%m-%d %H:%M:%S"
+                            )
+                            gateway_start_epoch = dt.timestamp()
+        except Exception:
+            pass
+
+        # ── Recent errors from logs (scoped to gateway start) ─────
+        recent_errors: list[str] = []
+        gpt_nonetype_count = 0
+        gpt_nonetype_recovered = 0
+        gpt_nonetype_unresolved = 0
+        reasoning_conflict_count = 0
+        primary_fallback_events = 0
+        http_400 = http_401 = http_403 = http_404 = http_429 = 0
+        traceback_count = 0
+        traceback_unresolved = 0
+        auth_failed_count = 0
+        provider_final_failures = 0
+        patterns = [
+            "NoneType",
+            "Traceback",
+            "Provider authentication failed",
+            "Primary model failed",
+            "HTTP 400",
+            "HTTP 401",
+            "HTTP 403",
+            "HTTP 404",
+            "HTTP 429",
+            "cannot specify both 'thinking' and 'reasoning_effort'",
+        ]
+        # Recovery markers: log lines that indicate a Codex stream error
+        # was caught and retried/salvaged, not a final failure.
+        recovery_markers = [
+            "Codex Responses stream received malformed event",
+            "Codex Responses stream TypeError (NoneType); retrying",
+            "Codex stream: salvaging",
+        ]
+        for log_name in ["agent.log", "gateway.log"]:
+            log_path = logs_dir / log_name
+            if not log_path.exists():
+                continue
+            try:
+                with open(log_path, "rb") as f:
+                    f.seek(0, 2)
+                    size = f.tell()
+                    f.seek(max(0, size - 200_000))
+                    tail = f.read().decode("utf-8", errors="replace")
+                # Filter by gateway start time if known
+                if gateway_start_epoch > 0:
+                    filtered_lines: list[str] = []
+                    for line in tail.splitlines():
+                        try:
+                            ts_str = line[:19]
+                            from datetime import datetime
+                            dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                            if dt.timestamp() >= gateway_start_epoch - 5:
+                                filtered_lines.append(line)
+                        except (ValueError, IndexError):
+                            filtered_lines.append(line)
+                    tail = "\n".join(filtered_lines)
+                # Check for recovery markers in the scoped window
+                has_recovery = any(
+                    m.lower() in tail.lower() for m in recovery_markers
+                )
+                for pattern in patterns:
+                    count = tail.lower().count(pattern.lower())
+                    pl = pattern.lower()
+                    if "nonetype" in pl:
+                        gpt_nonetype_count += count
+                        if has_recovery:
+                            gpt_nonetype_recovered += count
+                        else:
+                            gpt_nonetype_unresolved += count
+                    elif "thinking' and 'reasoning_effort'" in pl:
+                        reasoning_conflict_count += count
+                    elif "primary model failed" in pl:
+                        primary_fallback_events += count
+                    elif "traceback" in pl:
+                        traceback_count += count
+                        if not has_recovery:
+                            traceback_unresolved += count
+                    elif "provider authentication failed" in pl:
+                        auth_failed_count += count
+                    elif "http 400" in pl:
+                        http_400 += count
+                    elif "http 401" in pl:
+                        http_401 += count
+                    elif "http 403" in pl:
+                        http_403 += count
+                    elif "http 404" in pl:
+                        http_404 += count
+                    elif "http 429" in pl:
+                        http_429 += count
+                    if count:
+                        recent_errors.append(f"{pattern}: {count}")
+                # Count provider final failures (unresolved)
+                provider_final_failures += tail.lower().count(
+                    "provider failed after retries"
+                )
+            except Exception:
+                pass
+
+        # ── Recommendations ───────────────────────────────────────
+        recommendations: list[str] = []
+        if auth_failed_count > 0 or http_401 > 0 or http_403 > 0:
+            recommendations.append(
+                f"Auth failures detected ({auth_failed_count} auth, "
+                f"{http_401} x401, {http_403} x403). "
+                "Check credentials: `hermes auth` or `hermes setup`."
+            )
+        if gpt_nonetype_unresolved > 0:
+            recommendations.append(
+                f"GPT/Codex unresolved stream errors ({gpt_nonetype_unresolved}). "
+                "Check gateway logs for details."
+            )
+        if gpt_nonetype_recovered > 0:
+            if gpt_nonetype_recovered <= 10:
+                recommendations.append(
+                    f"Codex stream retry recovered {gpt_nonetype_recovered} "
+                    f"provider stream issue(s); monitor only."
+                )
+            else:
+                recommendations.append(
+                    f"Codex stream retry recovered {gpt_nonetype_recovered} "
+                    f"provider stream issues (high rate). Monitor closely."
+                )
+        if reasoning_conflict_count > 0:
+            recommendations.append(
+                f"Provider payload conflict ({reasoning_conflict_count}). "
+                "Sanitizer should be preventing these."
+            )
+        if primary_fallback_events > 0:
+            recommendations.append(
+                f"Primary model fallback events ({primary_fallback_events}). "
+                "Check provider logs."
+            )
+        if provider_final_failures > 0:
+            recommendations.append(
+                f"Provider final failures ({provider_final_failures}). "
+                "Check gateway logs for root cause."
+            )
+        if opencode_base_ok == "false":
+            names = ", ".join(opencode_bad_profiles)
+            recommendations.append(
+                f"Go profiles with bad base_url ({opencode_bad_count}): {names}. "
+                "Set base_url: https://opencode.ai/zen/go/v1."
+            )
+        if duplicate_processes == "true":
+            recommendations.append(
+                "Duplicate Hermes/Gateway/Telegram processes detected."
+            )
+
+        # ── Status determination ──────────────────────────────────
+        has_critical = (
+            gateway_status not in ("active", "unknown")
+            or opencode_base_ok == "false"
+            or provider_final_failures > 0
+            or (gpt_nonetype_unresolved > 3 and gateway_start_epoch > 0)
+            or (auth_failed_count > 3 and gateway_start_epoch > 0)
+        )
+        has_warning = (
+            (gpt_nonetype_unresolved > 0 and gateway_start_epoch > 0)
+            or (primary_fallback_events > 0 and gateway_start_epoch > 0)
+            or (reasoning_conflict_count > 0 and gateway_start_epoch > 0)
+            or (gpt_nonetype_recovered > 10 and gateway_start_epoch > 0)
+            or duplicate_processes == "true"
+        )
+        historical_errors_ignored = (
+            gateway_start_epoch > 0
+            and gpt_nonetype_count == 0
+            and primary_fallback_events == 0
+            and auth_failed_count == 0
+            and len(recent_errors) > 0
+        )
+        if has_critical:
+            status = "FAIL"
+        elif has_warning:
+            status = "WARN"
+        else:
+            status = "OK"
+
+        lines = [
+            "HERMES_DOCTOR_REPORT",
+            f"status: {status}",
+            "runtime:",
+            f"  active_profile: {profile_name}",
+            f"  effective_model: {effective_model}",
+            f"  effective_provider: {effective_provider}",
+            f"  api_mode: {api_mode}",
+            f"  override_present: {'true' if override_present else 'false'}",
+            f"  cached_agent_present: {'true' if cached_agent_present else 'false'}",
+            "services:",
+            f"  gateway: {gateway_status}",
+            f"  gateway_pid: {gateway_pid}",
+            f"  duplicate_processes: {duplicate_processes}",
+            "profiles:",
+            f"  total: {profile_count}",
+            f"  profile_check_status: {profile_check_status}",
+            f"  profiles_ok: {profiles_ok}",
+            f"  profiles_warn: {profiles_warn}",
+            f"  profiles_fail: {profiles_fail}",
+            f"  zero_effective_skill_profiles: {zero_skill}",
+            f"  dashboard_mismatch_profiles: {dash_mismatch}",
+            "providers:",
+            f"  opencode_go_base_url_ok: {opencode_base_ok}",
+        ]
+        if opencode_base_ok == "false":
+            lines.append(f"  opencode_go_bad_base_url_profiles: {opencode_bad_count}")
+            if opencode_bad_profiles:
+                lines.append("  opencode_go_bad_profiles:")
+                for bp in opencode_bad_profiles:
+                    lines.append(f"    - {bp}")
+        lines.extend([
+            f"  gpt_codex_stream_recovered_count: {gpt_nonetype_recovered}",
+            f"  gpt_codex_stream_unresolved_count: {gpt_nonetype_unresolved}",
+            f"  primary_fallback_events: {primary_fallback_events}",
+            f"  reasoning_param_conflict_count: {reasoning_conflict_count}",
+            "recent_errors_since_gateway_start:",
+            f"  scoped: {'true' if gateway_start_epoch > 0 else 'false'}",
+            f"  unresolved_count: {gpt_nonetype_unresolved + traceback_unresolved + provider_final_failures + auth_failed_count}",
+            f"  recovered_count: {gpt_nonetype_recovered}",
+            f"  NoneType_unresolved: {gpt_nonetype_unresolved}",
+            f"  Traceback_unresolved: {traceback_unresolved}",
+            f"  HTTP_400: {http_400}",
+            f"  HTTP_401: {http_401}",
+            f"  HTTP_403: {http_403}",
+            f"  HTTP_404: {http_404}",
+            f"  HTTP_429: {http_429}",
+            f"  provider_auth_failed: {auth_failed_count}",
+            f"  provider_final_failures: {provider_final_failures}",
+        ])
+        if historical_errors_ignored:
+            lines.append("  historical_errors_ignored: true")
+        if recent_errors:
+            lines.append("  top:")
+            for err in recent_errors[:5]:
+                lines.append(f"    - {err}")
+        lines.append("recommendations:")
+        if recommendations:
+            for rec in recommendations:
+                lines.append(f"  - {rec}")
+        else:
+            lines.append("  - No issues detected.")
 
         return "\n".join(lines)
 
@@ -12100,7 +12930,9 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=self._resolve_session_fallback_model(
+                        self._session_key_for_source(source)
+                    ),
                 )
                 try:
                     return agent.run_conversation(
@@ -15579,6 +16411,25 @@ class GatewayRunner:
         override = self._session_model_overrides.get(session_key)
         return override is not None and override.get("model") == agent_model
 
+    def _resolve_session_fallback_model(self, session_key: Optional[str]):
+        """Return the fallback chain to use for *session_key*.
+
+        If the session override declares ``fallback_providers`` (set by
+        ``/profile`` or ``/prompt <profile>`` routing), use the profile's
+        explicit policy — an empty list means "fail loud, no fallback"
+        (gpt-* / codex-implementer contract).  Otherwise fall back to the
+        gateway-wide ``self._fallback_model`` loaded from root config.
+
+        This prevents the root config's nvidia/kimi fallback chain from
+        leaking into a profile that declared ``fallback_providers: []``.
+        """
+        if not session_key:
+            return self._fallback_model
+        override = self._session_model_overrides.get(session_key)
+        if not override or "fallback_providers" not in override:
+            return self._fallback_model
+        return override.get("fallback_providers") or []
+
     def _release_running_agent_state(
         self,
         session_key: str,
@@ -16276,6 +17127,33 @@ class GatewayRunner:
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        # TASK-102: Merge session-scoped disabled_toolsets from telegram-router routing override.
+        # When the telegram-router plugin routes to an NVIDIA specialist profile, it stores
+        # disabled_toolsets in _session_model_overrides so the gateway can enforce them here.
+        if session_key:
+            _sr_dt = (self._session_model_overrides.get(session_key) or {}).get("disabled_toolsets")
+            if _sr_dt:
+                _base = set(disabled_toolsets or [])
+                disabled_toolsets = sorted(_base | set(_sr_dt))
+                logger.debug(
+                    "telegram-router: TASK-102 session=%s merged disabled_toolsets count=%d",
+                    session_key, len(disabled_toolsets),
+                )
+
+        # TASK-090: Apply profile-scoped toolsets from session override.
+        # When a profile (e.g. codex-implementer) specifies a restricted toolset
+        # list (e.g. ["hermes-cli"]), override enabled_toolsets to that list
+        # instead of using the global platform config. This prevents unwanted
+        # tools (e.g. mcp-agentmail) from being available when the profile's
+        # config intentionally excludes them.
+        if session_key:
+            _sr_ts = (self._session_model_overrides.get(session_key) or {}).get("toolsets")
+            if _sr_ts:
+                enabled_toolsets = sorted(set(str(ts) for ts in _sr_ts))
+                logger.debug(
+                    "telegram-router: TASK-090 session=%s overrode enabled_toolsets count=%d: %s",
+                    session_key, len(enabled_toolsets), enabled_toolsets,
+                )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -16943,6 +17821,84 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            # Inject profile_name from session override into ephemeral context
+            # so the agent knows which profile is active (codex-implementer, nvidia-*).
+            # Without this, the agent's persona hardcodes "default" and the profile
+            # handoff state is invisible to the agent.
+            _session_override = self._session_model_overrides.get(session_key or "", {})
+            _prof_name = _session_override.get("profile_name")
+            if _prof_name:
+                combined_ephemeral = (
+                    combined_ephemeral + "\n\n"
+                    f"Active Hermes profile: {_prof_name}"
+                ).strip()
+                os.environ["HERMES_PROFILE"] = _prof_name
+            elif "HERMES_PROFILE" in os.environ:
+                del os.environ["HERMES_PROFILE"]
+
+            # TASK-090: Preflight guard — prevent mcp_agentmail misuse for file writes.
+            # When a restricted profile (e.g. codex-implementer) is active AND the
+            # user message contains local filesystem write intent, verify that file
+            # write tools (terminal, file toolset) are actually available. If not,
+            # return BLOCKED_EXECUTOR_CONTEXT immediately instead of letting the
+            # model hallucinate shell commands or fall back to mcp_agentmail_* tools.
+            if _prof_name and message:
+                _msg_lower = (message or "").lower()
+                _has_file_write_intent = any(p in _msg_lower for p in (
+                    "/home/flashback/",
+                    "~/.hermes/",
+                    ".md",
+                    ".json",
+                    "write_file",
+                    "artifacts",
+                    "wiki file",
+                    "wiki-datei",
+                    "wiki",
+                    "files to write",
+                    "dateien schreiben",
+                    "zu schreiben",
+                ))
+                if _has_file_write_intent:
+                    _has_file_tools = bool(
+                        enabled_toolsets
+                        and any(
+                            ts in ("terminal", "file")
+                            for ts in enabled_toolsets
+                        )
+                    )
+                    # Also check resolved tools — composite toolsets like
+                    # hermes-cli may not have "terminal"/"file" in their name.
+                    if not _has_file_tools and enabled_toolsets:
+                        try:
+                            from toolsets import resolve_toolset
+                            _all_tool_names: set = set()
+                            for _ts_name in enabled_toolsets:
+                                _all_tool_names.update(resolve_toolset(_ts_name))
+                            _has_file_tools = bool(
+                                _all_tool_names
+                                & {"write_file", "terminal", "patch"}
+                            )
+                        except Exception:
+                            pass
+                    if not _has_file_tools:
+                        logger.warning(
+                            "TASK-090 BLOCKED_EXECUTOR_CONTEXT: profile=%s file_write_intent=true "
+                            "has_file_tools=false enabled_toolsets=%s",
+                            _prof_name, enabled_toolsets,
+                        )
+                        return {
+                            "final_response": (
+                                "BLOCKED_EXECUTOR_CONTEXT\n"
+                                f"reason: local file write requested but no terminal/write_file/direct "
+                                f"filesystem tool is available for profile '{_prof_name}'\n"
+                                f"available_toolsets: {enabled_toolsets}\n"
+                                f"forbidden_tool_misuse_prevented: true"
+                            ),
+                            "messages": [],
+                            "api_calls": 0,
+                            "tools": [],
+                        }
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
@@ -17141,7 +18097,7 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=self._resolve_session_fallback_model(session_key),
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
