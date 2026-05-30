@@ -48,12 +48,17 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    get_model_context_length,
     parse_available_output_tokens_from_error,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
+from agent.context_compressor import (
+    PromptContextBudgetExceeded,
+    enforce_request_input_budget,
+)
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -1077,6 +1082,70 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Hard preflight budget enforcement: ContextCompressor is threshold-
+        # based and can miss the first worker call, where system prompt,
+        # memory, skills, Kanban task context and comments arrive as one huge
+        # request.  Resolve the authoritative model context (including local
+        # *-32k/*-64k/*-128k suffixes) and make the request fit before any
+        # provider call is attempted.
+        try:
+            request_context_length = get_model_context_length(
+                agent.model,
+                agent.base_url or "",
+                api_key=getattr(agent, "api_key", "") or "",
+                config_context_length=getattr(agent, "_config_context_length", None),
+                provider=agent.provider or "",
+            )
+            api_messages, _budget_result = enforce_request_input_budget(
+                api_messages,
+                context_length=request_context_length,
+                tools=agent.tools or None,
+                reserved_output_tokens=agent.max_tokens,
+            )
+            if _budget_result.trimmed:
+                logger.warning(
+                    "Trimmed request context before provider call: model=%s provider=%s "
+                    "estimated_input %s -> %s, input_budget=%s, context=%s, "
+                    "output_reserve=%s, safety_margin=%s, removed_messages=%s",
+                    agent.model,
+                    agent.provider,
+                    _budget_result.original_estimated_tokens,
+                    _budget_result.estimated_tokens,
+                    _budget_result.input_budget,
+                    _budget_result.context_length,
+                    _budget_result.reserved_output_tokens,
+                    _budget_result.safety_margin,
+                    _budget_result.removed_messages,
+                )
+                api_messages = agent._sanitize_api_messages(api_messages)
+                api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+        except PromptContextBudgetExceeded as exc:
+            final_response = str(exc)
+            failed = True
+            _turn_exit_reason = "prompt_context_budget_exceeded"
+            messages.append({"role": "assistant", "content": final_response})
+            agent._emit_status("❌ Prompt still exceeds model context after truncation")
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
+        except Exception as exc:
+            final_response = f"Context budget preflight failed before provider call: {exc}"
+            failed = True
+            _turn_exit_reason = "context_budget_preflight_failed"
+            messages.append({"role": "assistant", "content": final_response})
+            agent._emit_status("❌ Context budget preflight failed before provider call")
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
 
         # Calculate approximate request size for logging
         total_chars = sum(len(str(msg)) for msg in api_messages)

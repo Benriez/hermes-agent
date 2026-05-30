@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error
@@ -29,6 +30,7 @@ from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     get_model_context_length,
     estimate_messages_tokens_rough,
+    estimate_request_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
 
@@ -113,6 +115,228 @@ _FALLBACK_TURN_MAX_CHARS = 700
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
+
+_CONTEXT_TRIM_NOTE = "[context trimmed: removed older history/tool output to fit model context]"
+
+
+class PromptContextBudgetExceeded(RuntimeError):
+    """Raised when a request cannot be made to fit inside the model context."""
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    context_length: int
+    reserved_output_tokens: int
+    safety_margin: int
+    input_budget: int
+
+
+@dataclass(frozen=True)
+class ContextBudgetEnforcementResult:
+    trimmed: bool
+    original_estimated_tokens: int
+    estimated_tokens: int
+    context_length: int
+    reserved_output_tokens: int
+    safety_margin: int
+    input_budget: int
+    removed_messages: int = 0
+
+
+def resolve_context_budget(
+    *, context_length: int, max_output_tokens: int | None = None
+) -> ContextBudget:
+    """Resolve the hard input budget for one provider request.
+
+    ``context_length`` is the full model window.  The provider also needs room
+    for the completion, so request input is capped at
+    ``context - output_reserve - safety_margin``.  When the caller did not set
+    an explicit output cap, reserve 8K on 64K+ models and 4K on smaller ones.
+    """
+    ctx = int(context_length or 0)
+    if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+        reserve = int(max_output_tokens)
+    else:
+        reserve = 8192 if ctx >= 65_536 else 4096
+    safety = max(1024, int(ctx * 0.05))
+    input_budget = ctx - reserve - safety
+    return ContextBudget(
+        context_length=ctx,
+        reserved_output_tokens=reserve,
+        safety_margin=safety,
+        input_budget=input_budget,
+    )
+
+
+def _append_trim_note_to_last_user(messages: List[Dict[str, Any]]) -> None:
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if _CONTEXT_TRIM_NOTE in _content_text_for_contains(content):
+            return
+        msg["content"] = _append_text_to_content(
+            content,
+            "\n\n" + _CONTEXT_TRIM_NOTE if isinstance(content, str) and content else _CONTEXT_TRIM_NOTE,
+        )
+        return
+
+
+def _truncate_message_content_for_budget(
+    msg: Dict[str, Any], *, max_chars: int, note: str = "...[truncated to fit context]..."
+) -> bool:
+    content = msg.get("content")
+    if max_chars < 200:
+        return False
+    if isinstance(content, str):
+        if len(content) <= max_chars:
+            return False
+        head = max(100, int(max_chars * 0.60))
+        tail = max(80, max_chars - head - len(note) - 4)
+        msg["content"] = content[:head].rstrip() + "\n" + note + "\n" + content[-tail:].lstrip()
+        return True
+    if isinstance(content, list):
+        changed = False
+        budget_left = max_chars
+        new_parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                text = part["text"]
+                if len(text) > budget_left:
+                    keep = max(80, budget_left - len(note) - 4)
+                    part = {**part, "text": text[:keep].rstrip() + "\n" + note}
+                    changed = True
+                budget_left -= min(len(text), max(budget_left, 0))
+            new_parts.append(part)
+        if changed:
+            msg["content"] = new_parts
+        return changed
+    return False
+
+
+def enforce_request_input_budget(
+    messages: List[Dict[str, Any]],
+    *,
+    context_length: int,
+    tools: Any = None,
+    reserved_output_tokens: int | None = None,
+) -> tuple[List[Dict[str, Any]], ContextBudgetEnforcementResult]:
+    """Hard-cap final request messages before the provider call.
+
+    The function is deliberately deterministic and local: no summarizer LLM is
+    called.  It preserves all system messages and the latest user instruction,
+    prunes/removes older history/tool output first, then truncates the latest
+    user message only if a first-turn worker prompt is itself too large.
+    """
+    budget = resolve_context_budget(
+        context_length=context_length,
+        max_output_tokens=reserved_output_tokens,
+    )
+    if budget.input_budget <= 0:
+        raise PromptContextBudgetExceeded(
+            "Prompt still exceeds model context after truncation: no input budget remains "
+            f"(context={budget.context_length}, output_reserve={budget.reserved_output_tokens}, "
+            f"safety_margin={budget.safety_margin})"
+        )
+
+    def _estimate(ms: List[Dict[str, Any]]) -> int:
+        return estimate_request_tokens_rough(ms, tools=tools)
+
+    original_estimate = _estimate(messages)
+    if original_estimate <= budget.input_budget:
+        return list(messages), ContextBudgetEnforcementResult(
+            trimmed=False,
+            original_estimated_tokens=original_estimate,
+            estimated_tokens=original_estimate,
+            context_length=budget.context_length,
+            reserved_output_tokens=budget.reserved_output_tokens,
+            safety_margin=budget.safety_margin,
+            input_budget=budget.input_budget,
+        )
+
+    result = [m.copy() for m in messages]
+    removed = 0
+
+    def _last_user_index() -> int | None:
+        for i in range(len(result) - 1, -1, -1):
+            if result[i].get("role") == "user":
+                return i
+        return None
+
+    def _protected_indices() -> set[int]:
+        last_user = _last_user_index()
+        protected = {i for i, m in enumerate(result) if m.get("role") == "system"}
+        if last_user is not None:
+            protected.add(last_user)
+        return protected
+
+    # Pass 1: shrink old tool results and tool-call arguments while preserving
+    # the newest user instruction untouched.
+    protected = _protected_indices()
+    for i, msg in enumerate(result):
+        if i in protected:
+            continue
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), str) and len(msg["content"]) > 200:
+            call_id = msg.get("tool_call_id", "")
+            msg["content"] = f"[Old tool output removed to fit model context; tool_call_id={call_id}]"
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            new_tcs = []
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    args = tc.get("function", {}).get("arguments", "")
+                    if isinstance(args, str) and len(args) > 500:
+                        tc = {**tc, "function": {**tc["function"], "arguments": _truncate_tool_call_args_json(args)}}
+                new_tcs.append(tc)
+            msg["tool_calls"] = new_tcs
+
+    # Pass 2: remove older non-system/non-latest-user history from oldest to newest.
+    while _estimate(result) > budget.input_budget:
+        protected = _protected_indices()
+        candidate = None
+        for role in ("tool", "assistant", "user"):
+            for i, msg in enumerate(result):
+                if i not in protected and msg.get("role") == role:
+                    candidate = i
+                    break
+            if candidate is not None:
+                break
+        if candidate is None:
+            break
+        result.pop(candidate)
+        removed += 1
+
+    # Pass 3: if the latest user message is itself too large (common on first
+    # worker calls), keep its head and tail so task id/title plus acceptance
+    # criteria survive, then append the trim note.
+    if _estimate(result) > budget.input_budget:
+        last_user = _last_user_index()
+        if last_user is not None:
+            protected_without_user = [m for i, m in enumerate(result) if i != last_user]
+            overhead_tokens = _estimate(protected_without_user) + 256
+            available_chars = max(800, (budget.input_budget - overhead_tokens) * _CHARS_PER_TOKEN)
+            _truncate_message_content_for_budget(result[last_user], max_chars=available_chars)
+
+    _append_trim_note_to_last_user(result)
+    final_estimate = _estimate(result)
+    if final_estimate > budget.input_budget:
+        raise PromptContextBudgetExceeded(
+            "Prompt still exceeds model context after truncation "
+            f"(estimated_input={final_estimate}, input_budget={budget.input_budget}, "
+            f"context={budget.context_length}, output_reserve={budget.reserved_output_tokens}, "
+            f"safety_margin={budget.safety_margin})"
+        )
+
+    return result, ContextBudgetEnforcementResult(
+        trimmed=True,
+        original_estimated_tokens=original_estimate,
+        estimated_tokens=final_estimate,
+        context_length=budget.context_length,
+        reserved_output_tokens=budget.reserved_output_tokens,
+        safety_margin=budget.safety_margin,
+        input_budget=budget.input_budget,
+        removed_messages=removed,
+    )
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:

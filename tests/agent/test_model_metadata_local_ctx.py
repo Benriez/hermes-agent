@@ -511,10 +511,30 @@ class TestQueryLocalContextLengthNetworkError:
 
 
 # ---------------------------------------------------------------------------
+# Local model-id context suffix parsing — model name is source of truth
+# ---------------------------------------------------------------------------
+class TestParseContextFromLocalModelId:
+    def test_parses_supported_context_suffixes(self):
+        from agent.model_metadata import parse_context_from_local_model_id
+
+        assert parse_context_from_local_model_id("qwopus-27b-mtp-64k") == 65_536
+        assert parse_context_from_local_model_id("gemma-26b-a4b-32k") == 32_768
+        assert parse_context_from_local_model_id("gemma-26b-a4b-64k") == 65_536
+        assert parse_context_from_local_model_id("gemma-3n-e4b-192k") == 196_608
+        assert parse_context_from_local_model_id("qwen-35b-a3b-mtp-128k") == 131_072
+        assert parse_context_from_local_model_id("model-256k") == 262_144
+
+    def test_unknown_model_without_suffix_returns_none(self):
+        from agent.model_metadata import parse_context_from_local_model_id
+
+        assert parse_context_from_local_model_id("omnicoder-unknown") is None
+
+
+# ---------------------------------------------------------------------------
 # get_model_context_length — integration-style tests with mocked helpers
 # ---------------------------------------------------------------------------
-
 class TestGetModelContextLengthLocalFallback:
+
     """get_model_context_length uses local server query before falling back to 2M."""
 
     def test_local_endpoint_unknown_model_queries_server(self):
@@ -565,6 +585,31 @@ class TestGetModelContextLengthLocalFallback:
 
         assert result == LOCAL_UNKNOWN_FALLBACK_CONTEXT == 65536
         assert result != DEFAULT_FALLBACK_CONTEXT  # never 256k for local
+
+    def test_local_model_name_suffix_wins_when_endpoint_has_no_metadata(self):
+        """Known *-Nk local model names use the suffix, not a conservative 32k cap."""
+        from agent.model_metadata import get_model_context_length
+
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.is_local_endpoint", return_value=True), \
+             patch("agent.model_metadata._query_local_context_length", return_value=None):
+            result = get_model_context_length("qwopus-27b-mtp-64k", "http://localhost:11434/v1")
+
+        assert result == 65_536
+
+    def test_explicit_config_context_length_can_override_suffix(self):
+        from agent.model_metadata import get_model_context_length
+
+        result = get_model_context_length(
+            "qwopus-27b-mtp-64k",
+            "http://localhost:11434/v1",
+            config_context_length=32_768,
+            provider="local",
+        )
+
+        assert result == 32_768
 
     def test_non_local_endpoint_does_not_query_local_server(self):
         """For non-local endpoints, _query_local_context_length is not called."""
