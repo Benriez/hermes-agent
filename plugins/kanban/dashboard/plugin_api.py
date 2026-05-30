@@ -40,6 +40,7 @@ import hmac
 import json
 import logging
 import os
+import shlex
 import sqlite3
 import time
 from dataclasses import asdict
@@ -797,6 +798,7 @@ class UpdateTaskBody(BaseModel):
     title: Optional[str] = None
     body: Optional[str] = None
     result: Optional[str] = None
+    model_override: Optional[str] = None
     block_reason: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
@@ -814,6 +816,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
+        payload_fields = getattr(payload, "model_fields_set", None)
+        if payload_fields is None:
+            payload_fields = getattr(payload, "__fields_set__", set())
+
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
             try:
@@ -824,6 +830,26 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
+
+        # --- model override -----------------------------------------------
+        if "model_override" in payload_fields:
+            model_override = (payload.model_override or "").strip() or None
+            with kanban_db.write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET model_override = ? WHERE id = ?",
+                    (model_override, task_id),
+                )
+                if cur.rowcount != 1:
+                    raise HTTPException(status_code=404, detail="task not found")
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, 'model_override_updated', ?, ?)",
+                    (
+                        task_id,
+                        json.dumps({"model_override": model_override}),
+                        int(time.time()),
+                    ),
+                )
 
         # --- status -------------------------------------------------------
         if payload.status is not None:
@@ -920,6 +946,139 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
+    finally:
+        conn.close()
+
+
+def _payload_field_set(payload: BaseModel) -> set[str]:
+    fields = getattr(payload, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(payload, "__fields_set__", set())
+    return set(fields or set())
+
+
+def _profile_config_path(profile: str) -> Path:
+    from hermes_constants import get_hermes_home
+
+    home = Path(get_hermes_home())
+    if profile == "default":
+        return home / "config.yaml"
+    return home / "profiles" / profile / "config.yaml"
+
+
+def _load_worker_profile_config(profile: Optional[str], warnings: list[str]) -> dict[str, Any]:
+    if not profile:
+        warnings.append("No assignee/profile set; dispatcher may skip or use default_assignee")
+        return {}
+    path = _profile_config_path(profile)
+    if not path.is_file():
+        warnings.append(f"Profile config not found for {profile!r}")
+        return {}
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        warnings.append(f"Could not load profile config for {profile!r}: {exc}")
+        return {}
+    if not isinstance(loaded, dict):
+        warnings.append(f"Profile config for {profile!r} is not a mapping")
+        return {}
+    return loaded
+
+
+def _model_section_value(model_cfg: Any, *keys: str) -> Optional[str]:
+    if isinstance(model_cfg, str):
+        return model_cfg if "default" in keys or "model" in keys else None
+    if not isinstance(model_cfg, dict):
+        return None
+    for key in keys:
+        value = model_cfg.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _safe_fallback_entry(entry: Any) -> Any:
+    if not isinstance(entry, dict):
+        return entry
+    safe: dict[str, Any] = {}
+    for key in ("provider", "model", "api_mode", "base_url"):
+        value = entry.get(key)
+        if value not in (None, ""):
+            safe[key] = value
+    return safe
+
+
+def _fallback_chain_from_config(cfg: dict[str, Any]) -> Optional[list[Any]]:
+    if "fallback_providers" in cfg:
+        raw = cfg.get("fallback_providers") or []
+        if isinstance(raw, list):
+            return [_safe_fallback_entry(item) for item in raw]
+        return [_safe_fallback_entry(raw)]
+    if "fallback_model" in cfg:
+        raw = cfg.get("fallback_model")
+        if isinstance(raw, list):
+            return [_safe_fallback_entry(item) for item in raw]
+        if raw:
+            return [_safe_fallback_entry(raw)]
+        return []
+    return None
+
+
+def _build_route_preview(task: kanban_db.Task, board: Optional[str]) -> dict[str, Any]:
+    warnings: list[str] = []
+    profile = task.assignee or None
+    if profile == "default":
+        warnings.append("Worker will use DEFAULT profile")
+    cfg = _load_worker_profile_config(profile, warnings)
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    provider = _model_section_value(model_cfg, "provider")
+    profile_model = _model_section_value(model_cfg, "default", "model")
+    api_mode = _model_section_value(model_cfg, "api_mode") or cfg.get("api_mode") if isinstance(cfg, dict) else None
+    model_override = (task.model_override or "").strip() or None
+    effective_model = model_override or profile_model
+    fallback_providers = _fallback_chain_from_config(cfg) if isinstance(cfg, dict) else None
+
+    cmd = ["hermes"]
+    if profile:
+        cmd.extend(["-p", profile])
+    cmd.append("--accept-hooks")
+    cmd.extend(["--skills", "kanban-worker"])
+    if task.skills:
+        for skill in task.skills:
+            if skill and skill != "kanban-worker":
+                cmd.extend(["--skills", skill])
+    if model_override:
+        cmd.extend(["-m", model_override])
+    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+
+    return {
+        "task_id": task.id,
+        "board": board or kanban_db.get_current_board(),
+        "status": task.status,
+        "assignee": profile,
+        "profile": profile,
+        "model_override": model_override,
+        "effective_provider": provider,
+        "effective_model": effective_model,
+        "api_mode": api_mode,
+        "fallback_providers": fallback_providers,
+        "command_preview": shlex.join(cmd),
+        "warnings": warnings,
+    }
+
+
+@router.get("/tasks/{task_id}/route-preview")
+def route_preview(task_id: str, board: Optional[str] = Query(None)):
+    """Preview how the dispatcher would route a task without claiming or spawning it."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return _build_route_preview(task, board)
     finally:
         conn.close()
 

@@ -2477,6 +2477,23 @@
 
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
+    const lifecycleStep = t.current_step_key || t.assignee;
+    const lifecycleLabel = !lifecycleStep
+      ? (t.status === "done" ? "Pipeline complete"
+         : t.status === "blocked" ? "Blocked \u00b7 needs operator"
+         : "Unrouted")
+      : (lifecycleStep === "planner"           ? "Step 1/4 \u00b7 Planner"
+         : lifecycleStep === "builder"          ? "Step 2/4 \u00b7 Builder"
+         : lifecycleStep === "reviewer"         ? "Step 3/4 \u00b7 Reviewer"
+         : lifecycleStep === "knowledge-manager" ? "Step 4/4 \u00b7 Knowledge Manager"
+         : "Unrouted");
+    const lifecycleNext = !lifecycleStep
+      ? null
+      : (lifecycleStep === "planner"           ? "Next: create Task Capsule"
+         : lifecycleStep === "builder"          ? "Next: verification report"
+         : lifecycleStep === "reviewer"         ? "Next: audit/evidence review"
+         : lifecycleStep === "knowledge-manager" ? "Next: update Wiki/memory"
+         : null);
 
     return h("div", {
       ref: cardRef,
@@ -2556,6 +2573,19 @@
           ),
           h("div", { className: "hermes-kanban-card-title" },
             t.title || tx(i18n, "untitled", "(untitled)")),
+          lifecycleStep
+            ? h("div", { className: "hermes-kanban-card-lifecycle" },
+                h("span", { className: "hermes-kanban-lifecycle-step" }, lifecycleLabel),
+                lifecycleNext
+                  ? h("span", { className: "hermes-kanban-lifecycle-next" }, lifecycleNext)
+                  : null)
+            : t.status === "done"
+              ? h("div", { className: "hermes-kanban-card-lifecycle" },
+                  h("span", { className: "hermes-kanban-lifecycle-step" }, "Pipeline complete"))
+              : t.status === "blocked"
+                ? h("div", { className: "hermes-kanban-card-lifecycle" },
+                    h("span", { className: "hermes-kanban-lifecycle-step" }, "Blocked \u00b7 needs operator"))
+                : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -3163,6 +3193,12 @@
         }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
+      h(WorkerRoutingPanel, {
+        task: t,
+        boardSlug: props.boardSlug,
+        onPatch: props.onPatch,
+        onRefresh: props.onRefresh,
+      }),
       h(StatusActions, {
         task: t,
         onPatch: props.onPatch,
@@ -3428,6 +3464,133 @@
       h(Button, { onClick: props.onCancel,
         size: "sm",
       }, tx(t, "cancel", "Cancel")),
+    );
+  }
+
+  function _profileHint(profile) {
+    if (!profile) return "";
+    const bits = [];
+    if (profile.provider) bits.push(profile.provider);
+    if (profile.model) bits.push(profile.model);
+    return bits.join(" / ");
+  }
+
+  function _fallbackLabel(fallbacks) {
+    if (!fallbacks || !fallbacks.length) return "—";
+    return fallbacks.map(function (fb) {
+      if (!fb || typeof fb !== "object") return String(fb);
+      return [fb.provider, fb.model].filter(Boolean).join(" / ") || JSON.stringify(fb);
+    }).join(", ");
+  }
+
+  function WorkerRoutingPanel(props) {
+    const { t } = useI18n();
+    const task = props.task || {};
+    const [profiles, setProfiles] = useState([]);
+    const [profile, setProfile] = useState(task.assignee || "");
+    const [modelOverride, setModelOverride] = useState(task.model_override || "");
+    const [preview, setPreview] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [err, setErr] = useState(null);
+
+    useEffect(function () { setProfile(task.assignee || ""); }, [task.assignee]);
+    useEffect(function () { setModelOverride(task.model_override || ""); }, [task.model_override]);
+    useEffect(function () {
+      SDK.fetchJSON(`${API}/profiles`)
+        .then(function (d) { setProfiles((d && d.profiles) || []); })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); });
+    }, []);
+
+    const selectedProfile = profiles.find(function (p) { return p.name === profile; }) || null;
+    const effectiveProvider = preview && preview.effective_provider != null
+      ? preview.effective_provider
+      : (selectedProfile && selectedProfile.provider) || "—";
+    const effectiveModel = modelOverride.trim()
+      || ((preview && preview.effective_model) || (selectedProfile && selectedProfile.model) || "—");
+    const fallbackLabel = preview ? _fallbackLabel(preview.fallback_providers) : "—";
+    const warnings = (preview && preview.warnings) || [];
+    const defaultSelected = profile === "default";
+    const canRelease = task.status === "blocked" && !!profile && !defaultSelected;
+
+    function saveWorkerProfile() {
+      setErr(null);
+      return props.onPatch({
+        assignee: profile || "",
+        model_override: modelOverride,
+      });
+    }
+
+    function previewRoute() {
+      setBusy(true);
+      setErr(null);
+      return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/route-preview`, props.boardSlug))
+        .then(function (d) { setPreview(d); })
+        .catch(function (e) { setErr(parseApiErrorMessage(e)); })
+        .finally(function () { setBusy(false); });
+    }
+
+    function releaseToWorker() {
+      if (!canRelease) return Promise.resolve();
+      return props.onPatch({ status: "ready" });
+    }
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head" }, "WORKER ROUTING"),
+      h("div", { className: "text-xs text-muted-foreground mb-2" },
+        "Kanban workers do not use the Chat MODEL selector. They run with the selected worker profile. Only blocked is a safe parking state. Releasing sets the task to ready and may start a worker immediately. Status review is also spawnable — review agents can claim and run."),
+      defaultSelected ? h("div", { className: "text-xs mb-2", style: { color: "#d4b348" } },
+        "Workers use the DEFAULT profile. Choose a dedicated worker profile before release.") : null,
+      err ? h("div", { className: "text-xs text-destructive mb-2" }, err) : null,
+      h("div", { className: "hermes-kanban-meta-row" },
+        h("span", { className: "hermes-kanban-meta-label" }, "Profile / Worker"),
+        h(Select, Object.assign({
+          value: profile,
+          className: "h-7 text-xs flex-1",
+        }, selectChangeHandler(setProfile)),
+          h(SelectOption, { value: "" }, "— unassigned —"),
+          profiles.map(function (p) {
+            const hint = _profileHint(p);
+            return h(SelectOption, { key: p.name, value: p.name },
+              `${p.name}${p.is_default ? " (default)" : ""}${hint ? " — " + hint : ""}`);
+          }),
+        ),
+      ),
+      h(MetaRow, { label: "Effective provider", value: effectiveProvider }),
+      h(MetaRow, { label: "Effective model", value: effectiveModel }),
+      h(MetaRow, { label: "Fallback", value: fallbackLabel }),
+      h("div", { className: "hermes-kanban-meta-row" },
+        h("span", { className: "hermes-kanban-meta-label" }, "Model override"),
+        h(Input, {
+          value: modelOverride,
+          onChange: function (e) { setModelOverride(e.target.value); },
+          placeholder: "optional",
+          className: "h-7 text-xs flex-1",
+          style: { textTransform: "none" },
+          autoCapitalize: "none",
+          autoCorrect: "off",
+          spellCheck: false,
+        }),
+      ),
+      h("div", { className: "text-xs text-muted-foreground mb-2" },
+        `Safety: Status ${task.status || "unknown"} — Only blocked is a safe parking state. Statuses ready and review can start workers.`),
+      warnings.length ? h("div", { className: "text-xs text-muted-foreground mb-2" },
+        warnings.map(function (w, idx) { return h("div", { key: idx }, "⚠ ", w); })) : null,
+      preview ? h("pre", { className: "hermes-kanban-log-preview", style: { maxHeight: "9rem", overflow: "auto", whiteSpace: "pre-wrap" } },
+        JSON.stringify(preview, null, 2)) : null,
+      h("div", { className: "flex gap-2 flex-wrap" },
+        h(Button, { size: "sm", variant: "outline", onClick: saveWorkerProfile }, "Save worker profile"),
+        h(Button, { size: "sm", variant: "outline", disabled: busy, onClick: previewRoute },
+          busy ? "Previewing…" : "Preview route"),
+        h(Button, {
+          size: "sm",
+          variant: "outline",
+          disabled: !canRelease || task.status === "running",
+          title: defaultSelected
+            ? "Default profile is not safe for worker release"
+            : (!profile ? "Choose a worker profile first" : "Release blocked task to ready (may start worker immediately)"),
+          onClick: releaseToWorker,
+        }, "Release to worker (sets ready)"),
+      ),
     );
   }
 

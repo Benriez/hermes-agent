@@ -302,6 +302,26 @@
   margin-left: auto;
 }
 
+/* ---- Lifecycle step label (pipeline progress) ------------------------ */
+
+.hermes-kanban-card-lifecycle {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.1rem 0;
+}
+.hermes-kanban-lifecycle-step {
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: color-mix(in srgb, var(--color-ring) 75%, var(--color-muted-foreground));
+}
+.hermes-kanban-lifecycle-next {
+  font-size: 0.6rem;
+  color: var(--color-muted-foreground);
+  font-style: italic;
+}
+
 /* ---- Inline create --------------------------------------------------- */
 
 .hermes-kanban-inline-create {
