@@ -6401,39 +6401,83 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
-def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
-    """True if the bundled ``kanban-worker`` skill resolves for the home the
-    spawned worker will run under.
+def _config_disables_skill(config_path: Path, skill_name: str) -> bool:
+    """Return True when ``config_path`` disables ``skill_name``.
 
-    The dispatcher injects ``--skills kanban-worker`` into every worker. When
-    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
-    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
-    the bundled skill (it ships in the *default* root home, not every
-    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
-    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
-    worker before the agent loop runs. Gate the flag on actual resolvability;
-    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
-    omitting the flag only drops the supplementary pattern library.
+    This is intentionally local to the worker-spawn guard because the guard is
+    checking the *target worker profile's* home, not the dispatcher's current
+    global config. Missing or unreadable configs fail open: a bad diagnostic
+    guard must not crash the dispatcher, and runtime skill loading remains the
+    final authority.
     """
-    from pathlib import Path as _Path
-
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
-    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
+        text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
+        return False
+
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(text) or {}
+        skills = data.get("skills") if isinstance(data, dict) else None
+        disabled = skills.get("disabled") if isinstance(skills, dict) else None
+        if isinstance(disabled, (list, tuple, set)):
+            return any(str(item).strip() == skill_name for item in disabled)
+        if isinstance(disabled, str):
+            return disabled.strip() == skill_name
+    except Exception:
+        # PyYAML may be unavailable or the config may be malformed. Fall back
+        # to the narrow line-preserving shape used by profile configs.
         pass
+
+    return any(line.strip() == f"- {skill_name}" for line in text.splitlines())
+
+
+def _skill_file_exists_in_home(hermes_home: Optional[str], skill_name: str) -> bool:
+    """True if ``skill_name/SKILL.md`` exists under supported skill roots."""
+    base = Path(hermes_home) if hermes_home else (Path.home() / ".hermes")
+    roots = [base / "skills", base / "custom-skills"]
+    for skills_root in roots:
+        if not skills_root.is_dir():
+            continue
+        if (skills_root / skill_name / "SKILL.md").is_file():
+            return True
+        try:
+            for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
+                if skill_md.is_file():
+                    return True
+        except OSError:
+            continue
     return False
+
+
+def _resolve_task_skill_in_home(hermes_home: Optional[str], skill_name: str) -> bool:
+    """Return True only when a skill exists and is enabled in ``hermes_home``.
+
+    ``hermes_home`` is the home the worker process will run under. For profile
+    workers that is the profile directory (``~/.hermes/profiles/<name>``), so
+    ``<home>/config.yaml`` is authoritative for ``skills.disabled``.
+    """
+    if not skill_name:
+        return False
+    home = Path(hermes_home) if hermes_home else (Path.home() / ".hermes")
+    if not _skill_file_exists_in_home(str(home), skill_name):
+        return False
+    if _config_disables_skill(home / "config.yaml", skill_name):
+        return False
+    return True
+
+
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if ``kanban-worker`` resolves and is enabled for the worker home.
+
+    The dispatcher injects ``--skills kanban-worker`` into every worker when it
+    is safe to do so. Preloading a missing or profile-disabled skill is fatal at
+    CLI startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
+    worker before the agent loop runs, so the guard must mirror both the skill
+    file lookup and the target profile's ``skills.disabled`` state.
+    """
+    return _resolve_task_skill_in_home(hermes_home, "kanban-worker")
 
 
 def _worker_terminal_timeout_env(
@@ -6573,10 +6617,8 @@ def _default_spawn(
     # --skills is additive to the profile's default skill set.
     #
     # Only add the flag when the skill actually resolves for the home
-    # the worker runs under: the bundled skill is absent from many
-    # profile-scoped skills dirs, and preloading a missing skill is
-    # fatal at CLI startup. Omitting it is safe — the lifecycle
-    # contract still ships via KANBAN_GUIDANCE.
+    # the worker runs under and the target profile has not disabled it:
+    # preloading a missing or disabled skill is fatal at CLI startup.
     if _kanban_worker_skill_available(env.get("HERMES_HOME")):
         cmd.extend(["--skills", "kanban-worker"])
     # Per-task force-loaded skills. Each name goes in its own
