@@ -5223,6 +5223,71 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+_WORKER_LOG_FAILURE_TAIL_BYTES = 100 * 1024
+_RATE_LIMIT_LOG_RE = re.compile(
+    r"rate[ _-]?limit|\b429\b|too many requests|\bquota\b|"
+    r"insufficient_quota|servicequotaexceededexception|retry[ -]?after",
+    re.IGNORECASE,
+)
+_CONTEXT_OVERFLOW_LOG_RE = re.compile(
+    r"context_length|maximum context|prompt too long|context window|\bn_ctx\b|too many tokens",
+    re.IGNORECASE,
+)
+
+
+def _read_worker_log_tail(path: Path, *, tail_bytes: int = _WORKER_LOG_FAILURE_TAIL_BYTES) -> str:
+    """Read a bounded worker-log tail for failure classification.
+
+    Missing or unreadable logs are non-fatal; callers fall back to the
+    existing crash behavior. Decode errors are replaced so provider SDKs
+    that emit odd byte sequences cannot break crash handling.
+    """
+    try:
+        if not path.exists() or not path.is_file():
+            return ""
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+            data = f.read(tail_bytes)
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _classify_worker_log_failure(path: Path | str) -> Optional[str]:
+    """Classify a worker crash from its bounded log tail.
+
+    Returns ``"RATE_LIMIT"``, ``"CONTEXT_OVERFLOW"``, or ``None``. The
+    classifier deliberately emits only coarse categories; full logs can
+    contain secrets and must not be copied into task events/comments.
+    """
+    text = _read_worker_log_tail(Path(path))
+    if not text:
+        return None
+    if _RATE_LIMIT_LOG_RE.search(text):
+        return "RATE_LIMIT"
+    if _CONTEXT_OVERFLOW_LOG_RE.search(text):
+        return "CONTEXT_OVERFLOW"
+    return None
+
+
+def _suggest_fallback_profile_for_assignee(assignee: Optional[str]) -> Optional[str]:
+    """Return a human-only fallback suggestion for a blocked worker crash."""
+    if assignee and assignee.startswith("nvidia"):
+        return "local-implementer"
+    return None
+
+
+def _rate_limit_block_message(assignee: Optional[str]) -> str:
+    fallback = _suggest_fallback_profile_for_assignee(assignee)
+    suffix = f" Suggested fallback: {fallback}." if fallback else ""
+    return (
+        f"RATE_LIMIT detected for worker profile {assignee or '(unassigned)'.strip()}."
+        f"{suffix} Task remains blocked; operator approval required."
+    )
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -5252,7 +5317,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, assignee, worker_pid, claim_lock, started_at FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5303,6 +5368,52 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+
+                failure_class = _classify_worker_log_failure(worker_log_path(row["id"]))
+                if failure_class == "RATE_LIMIT":
+                    assignee = row["assignee"]
+                    fallback = _suggest_fallback_profile_for_assignee(assignee)
+                    message = _rate_limit_block_message(assignee)
+                    rate_error = f"RATE_LIMIT: {error_text}"
+                    metadata = dict(event_payload)
+                    metadata.update({
+                        "failure_class": "RATE_LIMIT",
+                        "assignee": assignee,
+                        "suggested_fallback": fallback,
+                    })
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "last_failure_error = ? "
+                        "WHERE id = ? AND status = 'running'",
+                        (rate_error[:500], row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        run_id = _end_run(
+                            conn, row["id"],
+                            outcome="blocked", status="blocked",
+                            summary=message,
+                            error=rate_error[:500],
+                            metadata=metadata,
+                        )
+                        _append_event(
+                            conn, row["id"], "rate_limited",
+                            metadata,
+                            run_id=run_id,
+                        )
+                        now = int(time.time())
+                        conn.execute(
+                            "INSERT INTO task_comments (task_id, author, body, created_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (row["id"], "kanban-dispatcher", message, now),
+                        )
+                        _append_event(
+                            conn, row["id"], "commented",
+                            {"author": "kanban-dispatcher", "len": len(message)},
+                            run_id=run_id,
+                        )
+                        crashed.append(row["id"])
+                    continue
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
