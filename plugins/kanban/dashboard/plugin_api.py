@@ -305,6 +305,18 @@ def _compute_task_diagnostics(
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
+
+    # Fix 4 workstream diagnostics are read-only parent/child stall signals.
+    # Merge them into the existing per-task diagnostic payload so current board
+    # cards, attention strip, and drawer renderer can display them without a
+    # separate UI polling loop.
+    for wd in kanban_db.get_workstream_diagnostics(conn):
+        tid = wd.get("task_id")
+        if not tid:
+            continue
+        if task_ids is not None and tid not in task_ids:
+            continue
+        out.setdefault(tid, []).append(wd)
     return out
 
 
@@ -500,6 +512,31 @@ def get_board(
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/workstream-diagnostics")
+def get_workstream_diagnostics_endpoint(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    task_id: Optional[str] = Query(None, description="Limit diagnostics to a task/workstream"),
+):
+    """Read-only parent/child workstream stall diagnostics."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        diagnostics = kanban_db.get_workstream_diagnostics(conn, task_id=task_id)
+        summary = {"total": len(diagnostics), "critical": 0, "warning": 0, "info": 0}
+        for d in diagnostics:
+            sev = d.get("severity") or "info"
+            if sev in summary:
+                summary[sev] += 1
+        return {
+            "ok": True,
+            "board": board,
+            "diagnostics": diagnostics,
+            "summary": summary,
         }
     finally:
         conn.close()

@@ -4472,3 +4472,126 @@ def test_dispatcher_health_error_sanitizes_secretish_text(kanban_home):
     assert "\n" not in (health["last_error"] or "")
     assert "sk-secret-token" not in (health["last_error"] or "")
     assert "<redacted>" in (health["last_error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# Workstream stall diagnostics (Fix 4)
+# ---------------------------------------------------------------------------
+
+def _codes(diags):
+    return {d["code"] for d in diags}
+
+
+def _make_parent_child(conn, *, parent_status="ready", child_status="todo"):
+    parent = kb.create_task(conn, title="parent", initial_status="running")
+    child = kb.create_task(conn, title="child", parents=[parent], initial_status="running")
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (parent_status, parent))
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (child_status, child))
+    conn.commit()
+    return parent, child
+
+
+def test_workstream_diagnostics_parent_claimed_with_todo_child(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, child = _make_parent_child(conn)
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?",
+            ("claim-1", 2000, parent),
+        )
+        conn.commit()
+        diags = kb.get_workstream_diagnostics(conn, now=1000)
+        codes = _codes(diags)
+        assert "WORKSTREAM_STALLED_PARENT_CLAIMED" in codes
+        claimed = next(d for d in diags if d["code"] == "WORKSTREAM_STALLED_PARENT_CLAIMED")
+        assert claimed["parent_id"] == parent
+        assert child in claimed["child_ids"]
+        assert claimed["evidence"]["parent_claim_lock"] is True
+    finally:
+        conn.close()
+
+
+def test_workstream_diagnostics_parent_stale_claim_with_todo_child(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, child = _make_parent_child(conn)
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?",
+            ("claim-1", 999, parent),
+        )
+        conn.commit()
+        diags = kb.get_workstream_diagnostics(conn, now=1000)
+        stale = next(d for d in diags if d["code"] == "WORKSTREAM_STALLED_PARENT_STALE_CLAIM")
+        assert stale["severity"] == "critical"
+        assert stale["evidence"]["claim_is_stale"] is True
+        assert child in stale["child_ids"]
+    finally:
+        conn.close()
+
+
+def test_workstream_diagnostics_child_waiting_on_parent(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, child = _make_parent_child(conn, parent_status="running", child_status="todo")
+        diags = kb.get_workstream_diagnostics(conn, task_id=child, now=1000)
+        waiting = next(d for d in diags if d["code"] == "WORKSTREAM_CHILD_WAITING_ON_PARENT")
+        assert waiting["task_id"] == child
+        assert waiting["parent_id"] == parent
+        assert waiting["reason"] == "child_waiting_on_incomplete_parent"
+    finally:
+        conn.close()
+
+
+def test_workstream_diagnostics_blocked_parent_with_pending_children(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, child = _make_parent_child(conn, parent_status="blocked", child_status="todo")
+        diags = kb.get_workstream_diagnostics(conn, now=1000)
+        blocked = next(d for d in diags if d["code"] == "WORKSTREAM_PARENT_BLOCKED_WITH_TODO_CHILDREN")
+        assert blocked["severity"] == "warning"
+        assert blocked["parent_id"] == parent
+        assert child in blocked["child_ids"]
+    finally:
+        conn.close()
+
+
+def test_workstream_diagnostics_done_parent_no_claimed_or_stale_false_positive(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, _child = _make_parent_child(conn, parent_status="done", child_status="todo")
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?",
+            ("old-claim", 1, parent),
+        )
+        conn.commit()
+        codes = _codes(kb.get_workstream_diagnostics(conn, now=1000))
+        assert "WORKSTREAM_STALLED_PARENT_CLAIMED" not in codes
+        assert "WORKSTREAM_STALLED_PARENT_STALE_CLAIM" not in codes
+    finally:
+        conn.close()
+
+
+def test_workstream_diagnostics_healthy_completed_chain_has_no_diagnostics(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, child = _make_parent_child(conn, parent_status="done", child_status="done")
+        assert kb.get_workstream_diagnostics(conn, now=1000) == []
+    finally:
+        conn.close()
+
+
+def test_workstream_diagnostics_are_read_only(kanban_home):
+    conn = kb.connect()
+    try:
+        parent, child = _make_parent_child(conn)
+        conn.execute("UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?", ("claim-1", 999, parent))
+        conn.commit()
+        before_tasks = [tuple(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
+        before_links = [tuple(r) for r in conn.execute("SELECT * FROM task_links ORDER BY parent_id, child_id").fetchall()]
+        assert kb.get_workstream_diagnostics(conn, now=1000)
+        after_tasks = [tuple(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
+        after_links = [tuple(r) for r in conn.execute("SELECT * FROM task_links ORDER BY parent_id, child_id").fetchall()]
+        assert after_tasks == before_tasks
+        assert after_links == before_links
+    finally:
+        conn.close()

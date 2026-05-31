@@ -38,7 +38,7 @@ import time
 # Severity rungs, ordered least → most urgent. The UI colors them
 # amber (warning), orange (error), red (critical). Sorted outputs put
 # critical first so operators see the worst fires at the top.
-SEVERITY_ORDER = ("warning", "error", "critical")
+SEVERITY_ORDER = ("info", "warning", "error", "critical")
 
 
 def severity_at_or_above(severity: Optional[str], threshold: Optional[str]) -> bool:
@@ -851,6 +851,36 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _result_is_controller_pending(task) -> bool:
+    """Return True for planner-style cards intentionally awaiting controller dispatch.
+
+    Under ``worker_policy.mode = controller_first`` (e.g. the
+    projects-autonomous-runner controller orchestrating
+    ``github_issue_to_kanban_lifecycle`` with ``max_packets_per_run = 1``),
+    planner cards finish by populating ``result.capsule_path`` (path to the
+    operator-curated capsule the planner wrote) and ``result.next_packet``
+    (declared next dispatch unit). They then sit in ``ready`` status
+    waiting for the controller to invoke an implementer — *intentionally*.
+    Without this check ``_rule_stranded_in_ready`` flags every one as
+    ``stranded`` after 30 min, producing dozens of false-positive
+    diagnostics (TASK-092 false-positive case).
+
+    Marker: ``result`` JSON has BOTH ``capsule_path`` (non-empty) AND a
+    ``next_packet`` key (any value, including empty string). Both keys are
+    only co-present when the planner explicitly handed off to a controller.
+    """
+    raw = _task_field(task, "result")
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return bool(data.get("capsule_path")) and ("next_packet" in data)
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
     claiming it.
@@ -894,6 +924,13 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         # Unassigned tasks: the dispatcher's ``skipped_unassigned`` is
         # already the right signal. A separate diagnostic here would
         # double-flag the same condition.
+        return []
+
+    # TASK-092: planner cards that have delivered a capsule and declared
+    # the next packet are intentionally awaiting controller dispatch
+    # (worker_policy.mode = controller_first). These are not stranded
+    # workers, they are controller-pending. Suppress the diagnostic.
+    if _result_is_controller_pending(task):
         return []
 
     # Find the most recent event that put this task into ready.

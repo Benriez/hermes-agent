@@ -2544,6 +2544,15 @@
          : lifecycleStep === "reviewer"         ? "Next: audit/evidence review"
          : lifecycleStep === "knowledge-manager" ? "Next: update Wiki/memory"
          : null);
+    const workstreamDiag = (t.diagnostics || []).find(function (d) {
+      return d && d.code && String(d.code).indexOf("WORKSTREAM_") === 0;
+    });
+    const workstreamLabel = !workstreamDiag ? null
+      : workstreamDiag.code === "WORKSTREAM_STALLED_PARENT_STALE_CLAIM" ? "Stale parent"
+      : workstreamDiag.code === "WORKSTREAM_STALLED_PARENT_CLAIMED" ? "Stalled"
+      : workstreamDiag.code === "WORKSTREAM_CHILD_WAITING_ON_PARENT" ? "Waiting"
+      : workstreamDiag.code === "WORKSTREAM_PARENT_BLOCKED_WITH_TODO_CHILDREN" ? "Parent blocked"
+      : "Workstream";
 
     return h("div", {
       ref: cardRef,
@@ -2591,10 +2600,11 @@
                     `${t.warnings.count} active diagnostic` +
                     (t.warnings.count === 1 ? "" : "s") +
                     ` (severity: ${t.warnings.highest_severity || "warning"}). ` +
+                    (workstreamDiag ? `${workstreamDiag.message || workstreamDiag.title}. ` : "") +
                     `Click to open for details.`
                   ),
-                }, t.warnings.highest_severity === "critical" ? "!!!" :
-                   t.warnings.highest_severity === "error" ? "!!" : "⚠")
+                }, workstreamLabel || (t.warnings.highest_severity === "critical" ? "!!!" :
+                   t.warnings.highest_severity === "error" ? "!!" : "⚠"))
               : null,
             t.priority > 0
               ? h(Badge, { className: "hermes-kanban-priority",

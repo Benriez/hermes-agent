@@ -2319,3 +2319,125 @@ def test_dashboard_bundle_separates_auto_decompose_from_dispatcher_runtime():
     assert "hermes-kanban-dispatcher-health--healthy" in css
     assert "hermes-kanban-dispatcher-health--disabled" in css
     assert "hermes-kanban-dispatcher-health--error" in css
+
+
+# ---------------------------------------------------------------------------
+# Workstream diagnostics endpoint / UI visibility (Fix 4)
+# ---------------------------------------------------------------------------
+
+def _dashboard_parent_child(client, *, parent_status="ready", child_status="todo"):
+    parent = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "parent", "initial_status": "running"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "child", "parents": [parent["id"]], "initial_status": "running"},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (parent_status, parent["id"]))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (child_status, child["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return parent["id"], child["id"]
+
+
+def test_workstream_diagnostics_endpoint_returns_summary_counts(client):
+    parent, child = _dashboard_parent_child(client)
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?", ("claim", 1, parent))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/workstream-diagnostics")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["summary"]["total"] >= 3
+    assert data["summary"]["critical"] >= 1
+    codes = {d["code"] for d in data["diagnostics"]}
+    assert "WORKSTREAM_STALLED_PARENT_CLAIMED" in codes
+    assert "WORKSTREAM_STALLED_PARENT_STALE_CLAIM" in codes
+    assert "WORKSTREAM_CHILD_WAITING_ON_PARENT" in codes
+
+
+def test_workstream_diagnostics_endpoint_task_id_filter(client):
+    parent, child = _dashboard_parent_child(client, parent_status="running", child_status="todo")
+    r = client.get(f"/api/plugins/kanban/workstream-diagnostics?task_id={child}")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["summary"]["total"] == len(data["diagnostics"])
+    assert data["diagnostics"]
+    assert all(d["task_id"] == child or d.get("parent_id") == child or child in d.get("child_ids", []) for d in data["diagnostics"])
+    assert any(d["code"] == "WORKSTREAM_CHILD_WAITING_ON_PARENT" for d in data["diagnostics"])
+
+
+def test_workstream_diagnostics_endpoint_missing_task_empty_ok(client):
+    r = client.get("/api/plugins/kanban/workstream-diagnostics?task_id=t_missing")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["diagnostics"] == []
+    assert data["summary"] == {"total": 0, "critical": 0, "warning": 0, "info": 0}
+
+
+def test_workstream_diagnostics_endpoint_is_read_only(client):
+    parent, child = _dashboard_parent_child(client)
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?", ("claim", 1, parent))
+        conn.commit()
+        before = [tuple(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
+        before_links = [tuple(r) for r in conn.execute("SELECT * FROM task_links ORDER BY parent_id, child_id").fetchall()]
+    finally:
+        conn.close()
+    r = client.get("/api/plugins/kanban/workstream-diagnostics")
+    assert r.status_code == 200, r.text
+    conn = kb.connect()
+    try:
+        after = [tuple(r) for r in conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()]
+        after_links = [tuple(r) for r in conn.execute("SELECT * FROM task_links ORDER BY parent_id, child_id").fetchall()]
+    finally:
+        conn.close()
+    assert after == before
+    assert after_links == before_links
+
+
+def test_board_and_task_payload_include_workstream_diagnostics(client):
+    parent, child = _dashboard_parent_child(client)
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ?", ("claim", 1, parent))
+        conn.commit()
+    finally:
+        conn.close()
+    board = client.get("/api/plugins/kanban/board").json()
+    cards = [t for c in board["columns"] for t in c["tasks"]]
+    parent_card = next(t for t in cards if t["id"] == parent)
+    assert any(d["code"] == "WORKSTREAM_STALLED_PARENT_STALE_CLAIM" for d in parent_card["diagnostics"])
+    assert parent_card["warnings"]["highest_severity"] == "critical"
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{child}").json()["task"]
+    assert any(d["code"] == "WORKSTREAM_CHILD_WAITING_ON_PARENT" for d in detail["diagnostics"])
+
+
+def test_workstream_diagnostics_absent_for_healthy_chain(client):
+    parent, child = _dashboard_parent_child(client, parent_status="done", child_status="done")
+    r = client.get("/api/plugins/kanban/workstream-diagnostics")
+    assert r.status_code == 200, r.text
+    assert r.json()["diagnostics"] == []
+
+
+def test_dashboard_bundle_mentions_workstream_diagnostic_labels():
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+    assert "Stale parent" in js
+    assert "Parent blocked" in js
+    assert "Waiting" in js
+    assert "WORKSTREAM_STALLED_PARENT_STALE_CLAIM" in js
+    assert "hermes-kanban-warning-badge--info" in css

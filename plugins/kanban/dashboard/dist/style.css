@@ -1403,6 +1403,7 @@
 }
 
 /* Warning-badge severity variants (overrides the base colour). */
+.hermes-kanban-warning-badge--info    { color: var(--color-muted-foreground); }
 .hermes-kanban-warning-badge--warning { color: var(--hermes-diag-warning); }
 .hermes-kanban-warning-badge--error   { color: var(--hermes-diag-error); font-weight: 700; }
 .hermes-kanban-warning-badge--critical { color: var(--hermes-diag-critical); font-weight: 700; }

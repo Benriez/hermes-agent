@@ -2614,6 +2614,212 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 
 
 # ---------------------------------------------------------------------------
+# Workstream diagnostics (read-only parent/child stall visibility)
+# ---------------------------------------------------------------------------
+
+_WORKSTREAM_NONTERMINAL_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review"}
+_WORKSTREAM_CHILD_WAITING_STATUSES = {"todo", "blocked"}
+_WORKSTREAM_PARENT_QUEUE_STATUSES = {"ready", "review"}
+_WORKSTREAM_PARENT_INCOMPLETE_STATUSES = {"ready", "review", "running", "blocked"}
+
+
+def _workstream_diag(
+    *,
+    code: str,
+    severity: str,
+    task_id: str,
+    scope: str,
+    message: str,
+    reason: str,
+    parent_id: Optional[str],
+    child_ids: list[str],
+    evidence: dict[str, Any],
+    operator_hint: str,
+    now: int,
+) -> dict[str, Any]:
+    """Build a dashboard-compatible diagnostic plus the Fix 4 contract fields."""
+    return {
+        "code": code,
+        "kind": code,
+        "severity": severity,
+        "task_id": task_id,
+        "scope": scope,
+        "message": message,
+        "reason": reason,
+        "parent_id": parent_id,
+        "child_ids": child_ids,
+        "evidence": evidence,
+        "operator_hint": operator_hint,
+        # Existing dashboard diagnostic renderer fields:
+        "title": message,
+        "detail": operator_hint,
+        "actions": [],
+        "first_seen_at": now,
+        "last_seen_at": now,
+        "count": 1,
+        "run_id": None,
+        "data": {
+            "reason": reason,
+            "parent_id": parent_id,
+            "child_ids": child_ids,
+            "operator_hint": operator_hint,
+            **evidence,
+        },
+    }
+
+
+def _row_int(row: sqlite3.Row, key: str) -> Optional[int]:
+    try:
+        val = row[key]
+    except Exception:
+        return None
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_workstream_diagnostics(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Return read-only parent/child workstream stall diagnostics.
+
+    This function only SELECTs from ``tasks`` and ``task_links``. It never calls
+    stale-claim recovery, dispatch, worker spawning, or any mutation helper.
+    ``now`` is injectable so tests can deterministically classify stale claims.
+    """
+    now_i = int(time.time() if now is None else now)
+    rows = conn.execute("SELECT * FROM tasks").fetchall()
+    tasks = {r["id"]: r for r in rows}
+    link_rows = conn.execute("SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id").fetchall()
+    children_by_parent: dict[str, list[str]] = {}
+    parents_by_child: dict[str, list[str]] = {}
+    for lr in link_rows:
+        children_by_parent.setdefault(lr["parent_id"], []).append(lr["child_id"])
+        parents_by_child.setdefault(lr["child_id"], []).append(lr["parent_id"])
+
+    diagnostics: list[dict[str, Any]] = []
+
+    def include(diag: dict[str, Any]) -> bool:
+        if not task_id:
+            return True
+        if diag.get("task_id") == task_id or diag.get("parent_id") == task_id:
+            return True
+        return task_id in (diag.get("child_ids") or [])
+
+    # Parent-scoped diagnostics.
+    for parent_id, child_ids_all in children_by_parent.items():
+        parent = tasks.get(parent_id)
+        if parent is None:
+            continue
+        children = [tasks[cid] for cid in child_ids_all if cid in tasks]
+        nonterminal = [c for c in children if c["status"] in _WORKSTREAM_NONTERMINAL_STATUSES]
+        todo_like = [c for c in children if c["status"] in {"todo", "triage", "scheduled"}]
+        parent_status = parent["status"]
+        claim_lock = parent["claim_lock"]
+        claim_expires = _row_int(parent, "claim_expires")
+        evidence = {
+            "parent_status": parent_status,
+            "parent_claim_lock": bool(claim_lock),
+            "parent_claim_expires": claim_expires,
+            "parent_worker_pid": _row_int(parent, "worker_pid"),
+            "parent_current_run_id": _row_int(parent, "current_run_id"),
+            "children_nonterminal_count": len(nonterminal),
+            "children_todo_count": len(todo_like),
+        }
+        nonterminal_ids = [c["id"] for c in nonterminal]
+        if parent_status in _WORKSTREAM_PARENT_QUEUE_STATUSES and claim_lock and nonterminal:
+            diag = _workstream_diag(
+                code="WORKSTREAM_STALLED_PARENT_CLAIMED",
+                severity="warning",
+                task_id=parent_id,
+                scope="parent",
+                message="Parent is claimed and may be stalled",
+                reason="parent_ready_or_review_claimed_with_pending_children",
+                parent_id=parent_id,
+                child_ids=nonterminal_ids,
+                evidence=evidence,
+                operator_hint="Inspect the parent claim/run. If it is stale, use an explicit recovery action before expecting children to route.",
+                now=now_i,
+            )
+            if include(diag):
+                diagnostics.append(diag)
+            if claim_expires is None or claim_expires < now_i:
+                diag = _workstream_diag(
+                    code="WORKSTREAM_STALLED_PARENT_STALE_CLAIM",
+                    severity="critical",
+                    task_id=parent_id,
+                    scope="workstream",
+                    message="Parent has a stale claim and pending children",
+                    reason="parent_claim_expired_or_missing_with_pending_children",
+                    parent_id=parent_id,
+                    child_ids=nonterminal_ids,
+                    evidence={**evidence, "claim_is_stale": True},
+                    operator_hint="Recover or reclaim the stale parent claim; children will remain effectively blocked until the parent progresses or links are changed.",
+                    now=now_i,
+                )
+                if include(diag):
+                    diagnostics.append(diag)
+        if parent_status == "blocked" and nonterminal:
+            diag = _workstream_diag(
+                code="WORKSTREAM_PARENT_BLOCKED_WITH_TODO_CHILDREN",
+                severity="warning",
+                task_id=parent_id,
+                scope="workstream",
+                message="Parent is blocked while children remain pending",
+                reason="blocked_parent_has_nonterminal_children",
+                parent_id=parent_id,
+                child_ids=nonterminal_ids,
+                evidence=evidence,
+                operator_hint="Decide whether children should keep waiting, be re-parented, or be released after resolving the parent block.",
+                now=now_i,
+            )
+            if include(diag):
+                diagnostics.append(diag)
+
+    # Child-scoped diagnostics.
+    for child_id, parent_ids_all in parents_by_child.items():
+        child = tasks.get(child_id)
+        if child is None or child["status"] not in _WORKSTREAM_CHILD_WAITING_STATUSES:
+            continue
+        for parent_id in parent_ids_all:
+            parent = tasks.get(parent_id)
+            if parent is None:
+                continue
+            parent_status = parent["status"]
+            if parent_status in _WORKSTREAM_PARENT_INCOMPLETE_STATUSES:
+                diag = _workstream_diag(
+                    code="WORKSTREAM_CHILD_WAITING_ON_PARENT",
+                    severity="info" if parent_status in {"ready", "review", "running"} else "warning",
+                    task_id=child_id,
+                    scope="child",
+                    message="Child is waiting for parent",
+                    reason="child_waiting_on_incomplete_parent",
+                    parent_id=parent_id,
+                    child_ids=[child_id],
+                    evidence={
+                        "child_status": child["status"],
+                        "parent_status": parent_status,
+                        "parent_claim_lock": bool(parent["claim_lock"]),
+                        "parent_claim_expires": _row_int(parent, "claim_expires"),
+                        "parent_worker_pid": _row_int(parent, "worker_pid"),
+                    },
+                    operator_hint="This child is not independently dispatchable until the parent completes, is unlinked, or the workstream is intentionally restructured.",
+                    now=now_i,
+                )
+                if include(diag):
+                    diagnostics.append(diag)
+    severity_rank = {"critical": 0, "error": 1, "warning": 2, "info": 3}
+    diagnostics.sort(key=lambda d: (severity_rank.get(d.get("severity"), 9), d.get("task_id") or "", d.get("code") or ""))
+    return diagnostics
+
+
+# ---------------------------------------------------------------------------
 # Comments & events
 # ---------------------------------------------------------------------------
 
