@@ -3117,6 +3117,38 @@ def release_stale_claims(
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    # Also recover ready+claimed stale locks — tasks that ended up in 'ready'
+    # with claim_lock still set (invisible to dispatch_once's
+    # "claim_lock IS NULL" filter).  Past the claim TTL these are definitely
+    # stale; just clear them.
+    ready_stale = conn.execute(
+        "SELECT id, claim_lock, worker_pid FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
+        "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+        (now,),
+    ).fetchall()
+    for row in ready_stale:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status = 'ready' AND claim_lock IS ? "
+                "  AND claim_expires IS NOT NULL AND claim_expires < ?",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            reclaimed += 1
+            _append_event(
+                conn, row["id"], "stale_claim_cleared",
+                {
+                    "reason": "stale_ready_claimed",
+                    "claim_lock_was": row["claim_lock"],
+                    "worker_pid_was": row["worker_pid"],
+                    "now": now,
+                },
+            )
+
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
@@ -4108,6 +4140,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         new_status = "todo" if undone_parents else "ready"
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),

@@ -543,6 +543,55 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
+def test_release_stale_claims_clears_ready_claimed_locks(
+    kanban_home, monkeypatch,
+):
+    """release_stale_claims must clear stale claim_lock on ready tasks.
+
+    A task in status='ready' with an expired claim_lock is invisible to
+    dispatch_once (which filters on claim_lock IS NULL). This invariant
+    gap must be repaired automatically so the dispatcher can see the task.
+    """
+    import json
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+
+        # Put task in the broken state: ready + expired claim + stale PID.
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', "
+            "claim_lock = ?, claim_expires = ?, worker_pid = ? "
+            "WHERE id = ?",
+            (f"{host}:deadworker", int(time.time()) - 3600, 99999, t),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+        # Verify the recovery event was logged.
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_claim_cleared'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["reason"] == "stale_ready_claimed"
+        assert payload["claim_lock_was"] == f"{host}:deadworker"
+        assert payload["worker_pid_was"] == 99999
+
+
 def test_detect_crashed_workers_systemic_failure_fast_block(
     kanban_home, monkeypatch,
 ):
@@ -1073,6 +1122,35 @@ def test_unblock_without_parents_goes_to_ready(kanban_home):
         assert kb.block_task(conn, t, reason="need input")
         assert kb.unblock_task(conn, t)
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_unblock_task_clears_stale_claim_fields(kanban_home):
+    """unblock_task must clear stale claim_lock/claim_expires/worker_pid.
+
+    If a task was blocked while claimed (status='running') and the claim
+    fields were inadvertently left set during block or re-set by a race,
+    unblock must clean them so the dispatcher's claim_lock IS NULL query
+    can see the task after it transitions to ready.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unblock-claim", assignee="a")
+        kb.claim_task(conn, t)
+        kb._set_worker_pid(conn, t, 77777)
+        assert kb.block_task(conn, t, reason="test block")
+        # Simulate stale claim fields that should have been cleared.
+        conn.execute(
+            "UPDATE tasks SET claim_lock = 'stale:lock', "
+            "claim_expires = 1, worker_pid = 77777 "
+            "WHERE id = ?",
+            (t,),
+        )
+        conn.commit()
+        assert kb.unblock_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
 
 
 def test_assign_refuses_while_running(kanban_home):
