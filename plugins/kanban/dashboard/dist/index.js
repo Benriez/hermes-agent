@@ -1018,6 +1018,20 @@
          onDelete: deleteSelected,
        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
+        h("div", { className: "hermes-kanban-status-legend" },
+          h("span", { className: "hermes-kanban-legend-item" },
+            h("span", { className: "hermes-kanban-dot hermes-kanban-dot-legend-ready" }),
+            " Ready = worker may start"
+          ),
+          h("span", { className: "hermes-kanban-legend-item" },
+            h("span", { className: "hermes-kanban-dot hermes-kanban-dot-legend-review" }),
+            " Review = review worker may start"
+          ),
+          h("span", { className: "hermes-kanban-legend-item" },
+            h("span", { className: "hermes-kanban-dot hermes-kanban-dot-legend-blocked" }),
+            " Blocked = safe parking / waits for operator"
+          ),
+        ),
         h(BoardColumns, {
           board: filteredBoard,
           laneByProfile,
@@ -1040,6 +1054,7 @@
           taskId: selectedTaskId,
           boardSlug: board,
           onClose: function () { setSelectedTaskId(null); },
+          onOpen: setSelectedTaskId,
           onRefresh: loadBoard,
           renderMarkdown: renderMd,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
@@ -1566,17 +1581,29 @@
       ? "▾ Orchestration settings"
       : "▸ Orchestration settings";
 
-    // Mode pill — always visible (collapsed or expanded). One click flips
-    // between Auto and Manual. Auto = dispatcher decomposes new triage tasks
-    // every tick. Manual = pre-PR behavior, the user clicks ⚗ Decompose on
-    // each triage card (or runs `hermes kanban decompose <id>`) and tasks
-    // stay in triage until then.
+    // Separate config from runtime truth. Auto-decompose is only a config
+    // toggle; dispatcher health comes from /dispatcher-health (or the
+    // orchestration payload mirror) and may legitimately be Unknown.
     const autoOn = !!(settings && settings.auto_decompose);
+    const dispatcher = (settings && settings.dispatcher_health) || {};
+    const dispatcherStatus = String(dispatcher.status || "unknown");
+    const dispatcherLabel = dispatcherStatus.charAt(0).toUpperCase() + dispatcherStatus.slice(1);
+    const dispatcherTitle = settings === null
+      ? "Loading dispatcher runtime health…"
+      : [
+          "Dispatcher runtime: " + dispatcherLabel,
+          "Source: " + (dispatcher.source || "unknown"),
+          "Reason: " + (dispatcher.reason || "unknown"),
+          "Last tick: " + (dispatcher.last_tick_at || "never"),
+          "Last success: " + (dispatcher.last_success_at || "never"),
+          "Last error: " + (dispatcher.last_error || "none"),
+          "Interval: " + (dispatcher.interval_seconds == null ? "unknown" : dispatcher.interval_seconds + "s"),
+        ].join("\n");
     const modePillTitle = settings === null
-      ? "Loading mode…"
+      ? "Loading auto-decompose config…"
       : (autoOn
-          ? "Orchestration: Auto — the dispatcher decomposes new triage tasks automatically every tick. Click to switch to Manual (pre-PR behavior)."
-          : "Orchestration: Manual — triage tasks stay in triage until you click ⚗ Decompose on each card. Click to switch to Auto.");
+          ? "Auto-decompose: On — new triage tasks may be decomposed automatically when a healthy dispatcher ticks. Click to turn Off."
+          : "Auto-decompose: Off — triage tasks stay in triage until you click ⚗ Decompose. Click to turn On.");
     const modePill = h("button", {
       type: "button",
       onClick: function () {
@@ -1591,14 +1618,24 @@
                     ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
                     : "border-muted-foreground/30 bg-muted/30 text-muted-foreground"),
     },
-      "Orchestration: ",
+      "Auto-decompose: ",
       h("span", { className: "ml-1 font-semibold" },
-        settings === null ? "…" : (autoOn ? "Auto" : "Manual"))
+        settings === null ? "…" : (autoOn ? "On" : "Off"))
+    );
+    const dispatcherPill = h("span", {
+      title: dispatcherTitle,
+      className: "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 "
+                 + "text-xs font-medium hermes-kanban-dispatcher-health hermes-kanban-dispatcher-health--"
+                 + dispatcherStatus,
+    },
+      "Dispatcher: ",
+      h("span", { className: "ml-1 font-semibold" }, settings === null ? "…" : dispatcherLabel)
     );
 
     if (!expanded) {
       return h("div", { className: "flex items-center gap-3 text-xs" },
         modePill,
+        dispatcherPill,
         h("button", {
           type: "button",
           onClick: function () { setExpanded(true); },
@@ -1622,6 +1659,7 @@
             className: "text-sm font-medium underline-offset-2 hover:underline",
           }, headerLabel),
           modePill,
+          dispatcherPill,
           h(Button, { onClick: loadAll, size: "sm" }, "Reload"),
         ),
         msg ? h("div", {
@@ -1663,7 +1701,7 @@
           ),
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs text-muted-foreground" },
-              "Orchestration mode"),
+              "Auto-decompose config"),
             h("label", { className: "flex items-center gap-2 text-xs h-8" },
               h(Checkbox, {
                 checked: !!settings.auto_decompose,
@@ -1680,6 +1718,18 @@
           ),
         ) : h("div", { className: "text-xs text-muted-foreground" },
           "Loading…"),
+
+        settings ? h("div", { className: "hermes-kanban-dispatcher-detail" },
+          h(Label, { className: "text-xs text-muted-foreground" }, "Dispatcher runtime"),
+          h("div", { className: "text-xs" },
+            "Dispatcher: ", h("strong", null, dispatcherLabel),
+            " · Source: ", dispatcher.source || "unknown",
+            " · Last tick: ", dispatcher.last_tick_at || "never",
+            " · Last success: ", dispatcher.last_success_at || "never",
+            dispatcher.last_error ? " · Last error: " + dispatcher.last_error : ""),
+          h("div", { className: "text-[10px] text-muted-foreground" },
+            "Runtime health is observed separately from Auto-decompose config; Unknown does not mean Healthy."),
+        ) : null,
 
         h("div", { className: "border-t pt-3" },
           h(Label, { className: "text-xs text-muted-foreground" },
@@ -2630,17 +2680,35 @@
     // input here to save vertical space in the common `scratch` case.
     const [workspaceKind, setWorkspaceKind] = useState("scratch");
     const [workspacePath, setWorkspacePath] = useState("");
+    const [body, setBody] = useState("");
+    const [status, setStatus] = useState("blocked");
+    const [showAdvanced, setShowAdvanced] = useState(false);
+    const [allowedFiles, setAllowedFiles] = useState("");
+    const [forbiddenFiles, setForbiddenFiles] = useState("");
+    const [acceptanceCriteria, setAcceptanceCriteria] = useState("");
+    const [validationCommands, setValidationCommands] = useState("");
+    const [safetyRules, setSafetyRules] = useState("");
 
     const submit = function () {
       const trimmed = title.trim();
       if (!trimmed) return;
-      const body = {
+      // Build structured body from description + advanced fields
+      var bodyParts = [];
+      if (body.trim()) bodyParts.push("## Description\n" + body.trim());
+      if (allowedFiles.trim()) bodyParts.push("## Allowed Files\n" + allowedFiles.trim());
+      if (forbiddenFiles.trim()) bodyParts.push("## Forbidden Files\n" + forbiddenFiles.trim());
+      if (acceptanceCriteria.trim()) bodyParts.push("## Acceptance Criteria\n" + acceptanceCriteria.trim());
+      if (validationCommands.trim()) bodyParts.push("## Validation\n" + validationCommands.trim());
+      if (safetyRules.trim()) bodyParts.push("## Safety\n" + safetyRules.trim());
+      var constructedBody = bodyParts.length > 0 ? bodyParts.join("\n\n") : null;
+      const bodyPayload = {
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
-        triage: props.columnName === "triage",
+        initial_status: status,
       };
-      if (parent) body.parents = [parent];
+      if (constructedBody) bodyPayload.body = constructedBody;
+      if (parent) bodyPayload.parents = [parent];
       // Parse comma-separated skills into a clean list. Blank = no
       // extras (omit key so backend leaves it null). The dispatcher
       // always auto-loads kanban-worker; these are extras on top.
@@ -2648,17 +2716,20 @@
         .split(",")
         .map(function (s) { return s.trim(); })
         .filter(function (s) { return s.length > 0; });
-      if (skillList.length > 0) body.skills = skillList;
+      if (skillList.length > 0) bodyPayload.skills = skillList;
       // Only send workspace_kind when it's non-default. Keeps the request
       // shape small and interoperable with older dispatcher versions.
       if (workspaceKind && workspaceKind !== "scratch") {
-        body.workspace_kind = workspaceKind;
+        bodyPayload.workspace_kind = workspaceKind;
       }
       const wpTrim = workspacePath.trim();
-      if (wpTrim) body.workspace_path = wpTrim;
-      props.onSubmit(body);
+      if (wpTrim) bodyPayload.workspace_path = wpTrim;
+      props.onSubmit(bodyPayload);
       setTitle(""); setAssignee(""); setPriority(0); setParent(""); setSkills("");
       setWorkspaceKind("scratch"); setWorkspacePath("");
+      setBody(""); setStatus("blocked"); setShowAdvanced(false);
+      setAllowedFiles(""); setForbiddenFiles(""); setAcceptanceCriteria("");
+      setValidationCommands(""); setSafetyRules("");
     };
 
     const showPathInput = workspaceKind !== "scratch";
@@ -2681,6 +2752,18 @@
         autoFocus: true,
         className: "text-sm min-h-[2rem] max-h-32 resize-y w-full border border-input bg-transparent px-2 py-1 rounded-md focus:outline-none focus:ring-2 focus:ring-ring",
         rows: 2,
+      }),
+      // Warning banner for spawnable columns
+      (props.columnName === "ready" || props.columnName === "review") ? h("div", {
+        className: "hermes-kanban-create-warning",
+      }, "Ready and review are spawnable. This task will still be created as blocked unless you explicitly override.") : null,
+      // Body / description textarea
+      h("textarea", {
+        value: body,
+        onChange: function (e) { setBody(e.target.value); },
+        placeholder: tx(t, "bodyPlaceholder", "Description (optional)…"),
+        className: "hermes-kanban-create-body",
+        rows: 3,
       }),
       h("div", { className: "flex gap-2" },
         h(Input, {
@@ -2715,6 +2798,18 @@
         title: "Force-load these skills into the worker (in addition to the built-in kanban-worker).",
         className: "h-7 text-xs",
       }),
+      // Status selector
+      h("div", { className: "flex gap-2" },
+        h(Select, Object.assign({
+          value: status,
+          title: "Default: blocked (safe parking, no worker starts). ready/review spawn a worker immediately.",
+          className: "h-7 text-xs w-32",
+        }, selectChangeHandler(setStatus)),
+          h(SelectOption, { value: "blocked" }, "blocked (safe)"),
+          h(SelectOption, { value: "ready" }, "ready (spawnable)"),
+          h(SelectOption, { value: "review" }, "review (spawnable)"),
+        ),
+      ),
       h("div", { className: "flex gap-2" },
         h(Select, Object.assign({
           value: workspaceKind,
@@ -2743,6 +2838,55 @@
             `${task.id} — ${(task.title || "").slice(0, 50)}`);
         }),
       ),
+      // Advanced fields toggle
+      h("div", { className: "hermes-kanban-create-advanced-toggle" },
+        h("button", {
+          onClick: function (e) { e.preventDefault(); setShowAdvanced(!showAdvanced); },
+          className: "hermes-kanban-create-advanced-btn",
+        }, showAdvanced ? "− Advanced" : "+ Advanced"),
+      ),
+      showAdvanced ? h("div", { className: "hermes-kanban-create-advanced-fields" },
+        h("label", { className: "hermes-kanban-create-advanced-label" }, "Allowed Files"),
+        h("textarea", {
+          value: allowedFiles,
+          onChange: function (e) { setAllowedFiles(e.target.value); },
+          placeholder: "e.g. src/**/*.py\ntests/**/*.py",
+          className: "hermes-kanban-create-body",
+          rows: 2,
+        }),
+        h("label", { className: "hermes-kanban-create-advanced-label" }, "Forbidden Files"),
+        h("textarea", {
+          value: forbiddenFiles,
+          onChange: function (e) { setForbiddenFiles(e.target.value); },
+          placeholder: "e.g. config.yaml\n.env",
+          className: "hermes-kanban-create-body",
+          rows: 2,
+        }),
+        h("label", { className: "hermes-kanban-create-advanced-label" }, "Acceptance Criteria"),
+        h("textarea", {
+          value: acceptanceCriteria,
+          onChange: function (e) { setAcceptanceCriteria(e.target.value); },
+          placeholder: "1. Feature works\n2. Tests pass",
+          className: "hermes-kanban-create-body",
+          rows: 2,
+        }),
+        h("label", { className: "hermes-kanban-create-advanced-label" }, "Validation Commands"),
+        h("textarea", {
+          value: validationCommands,
+          onChange: function (e) { setValidationCommands(e.target.value); },
+          placeholder: "node --check index.js\npytest",
+          className: "hermes-kanban-create-body",
+          rows: 2,
+        }),
+        h("label", { className: "hermes-kanban-create-advanced-label" }, "Safety Rules"),
+        h("textarea", {
+          value: safetyRules,
+          onChange: function (e) { setSafetyRules(e.target.value); },
+          placeholder: "e.g. No auto-start. No service restart.",
+          className: "hermes-kanban-create-body",
+          rows: 2,
+        }),
+      ) : null,
       h("div", { className: "flex gap-2" },
         h(Button, {
           onClick: submit,
@@ -3011,6 +3155,7 @@
           assignees: props.assignees || [],
           boardSlug: boardSlug,
           onPatch: doPatch,
+          onOpen: props.onOpen,
           onSpecify: doSpecify,
           onDecompose: doDecompose,
           onAddParent: addLink,
@@ -3225,6 +3370,7 @@
       h(DependencyEditor, {
         task: t,
         links, allTasks: props.allTasks,
+        onOpen: props.onOpen,
         onAddParent: props.onAddParent,
         onRemoveParent: props.onRemoveParent,
         onAddChild: props.onAddChild,
@@ -3726,14 +3872,20 @@
           (links.parents || []).length === 0
             ? h("span", { className: "hermes-kanban-deps-empty" }, tx(t, "none", "none"))
             : (links.parents || []).map(function (id) {
+                const tk = (allTasks || []).find(function (t) { return t.id === id; });
+                if (tk) {
+                  const sId = tk.id.length > 12 ? tk.id.slice(0, 12) + "…" : tk.id;
+                  return h("div", { key: id, className: "hermes-kanban-dep-row", onClick: function () { if (props.onOpen) props.onOpen(id); } },
+                    h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[tk.status] || "") }),
+                    h("span", { className: "hermes-kanban-dep-row-title" }, (tk.title || "").slice(0, 50)),
+                    h("span", { className: "hermes-kanban-dep-row-id" }, sId),
+                    tk.assignee ? h("span", { className: "hermes-kanban-dep-row-assignee" }, tk.assignee) : null,
+                    h("button", { type: "button", className: "hermes-kanban-dep-chip-x", onClick: function (e) { e.stopPropagation(); props.onRemoveParent(id); }, title: tx(t, "removeDependency", "Remove dependency") }, "×"),
+                  );
+                }
                 return h("span", { key: id, className: "hermes-kanban-dep-chip" },
-                  id,
-                  h("button", {
-                    type: "button",
-                    className: "hermes-kanban-dep-chip-x",
-                    onClick: function () { props.onRemoveParent(id); },
-                    title: tx(t, "removeDependency", "Remove dependency"),
-                  }, "×"),
+                  id, " (details unavailable)",
+                  h("button", { type: "button", className: "hermes-kanban-dep-chip-x", onClick: function () { props.onRemoveParent(id); }, title: tx(t, "removeDependency", "Remove dependency") }, "×"),
                 );
               }),
         ),
@@ -3764,14 +3916,20 @@
           (links.children || []).length === 0
             ? h("span", { className: "hermes-kanban-deps-empty" }, tx(t, "none", "none"))
             : (links.children || []).map(function (id) {
+                const tk = (allTasks || []).find(function (t) { return t.id === id; });
+                if (tk) {
+                  const sId = tk.id.length > 12 ? tk.id.slice(0, 12) + "…" : tk.id;
+                  return h("div", { key: id, className: "hermes-kanban-dep-row", onClick: function () { if (props.onOpen) props.onOpen(id); } },
+                    h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[tk.status] || "") }),
+                    h("span", { className: "hermes-kanban-dep-row-title" }, (tk.title || "").slice(0, 50)),
+                    h("span", { className: "hermes-kanban-dep-row-id" }, sId),
+                    tk.assignee ? h("span", { className: "hermes-kanban-dep-row-assignee" }, tk.assignee) : null,
+                    h("button", { type: "button", className: "hermes-kanban-dep-chip-x", onClick: function (e) { e.stopPropagation(); props.onRemoveChild(id); }, title: tx(t, "removeDependency", "Remove dependency") }, "×"),
+                  );
+                }
                 return h("span", { key: id, className: "hermes-kanban-dep-chip" },
-                  id,
-                  h("button", {
-                    type: "button",
-                    className: "hermes-kanban-dep-chip-x",
-                    onClick: function () { props.onRemoveChild(id); },
-                    title: tx(t, "removeDependency", "Remove dependency"),
-                  }, "×"),
+                  id, " (details unavailable)",
+                  h("button", { type: "button", className: "hermes-kanban-dep-chip-x", onClick: function () { props.onRemoveChild(id); }, title: tx(t, "removeDependency", "Remove dependency") }, "×"),
                 );
               }),
         ),

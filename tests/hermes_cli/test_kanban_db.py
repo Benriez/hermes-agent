@@ -4418,3 +4418,57 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher health observer contract
+# ---------------------------------------------------------------------------
+
+def test_dispatcher_health_unknown_when_no_gateway_state(kanban_home):
+    health = kb.read_dispatcher_health()
+    assert health["available"] is False
+    assert health["enabled"] is None
+    assert health["status"] == "unknown"
+    assert health["reason"] == "dispatcher_health_not_available"
+
+
+def test_dispatcher_health_disabled_state(kanban_home):
+    health = kb.write_dispatcher_health(
+        enabled=False,
+        source="gateway",
+        reason="disabled_by_config",
+        interval_seconds=60,
+    )
+    assert health["available"] is True
+    assert health["enabled"] is False
+    assert health["status"] == "disabled"
+    assert health["reason"] == "disabled_by_config"
+
+
+def test_dispatcher_health_healthy_and_stale_calculation():
+    data = {
+        "available": True,
+        "enabled": True,
+        "source": "gateway",
+        "last_tick_at": 1000.0,
+        "last_success_at": 1000.0,
+        "interval_seconds": 60,
+    }
+    assert kb.evaluate_dispatcher_health(data, now=1060.0)["status"] == "healthy"
+    stale = kb.evaluate_dispatcher_health(data, now=1130.0)
+    assert stale["status"] == "stale"
+    assert stale["reason"] == "last_tick_stale"
+
+
+def test_dispatcher_health_error_sanitizes_secretish_text(kanban_home):
+    health = kb.write_dispatcher_health(
+        enabled=True,
+        source="gateway",
+        interval_seconds=60,
+        last_error_at=1000.0,
+        last_error="Traceback\nRuntimeError api_key=sk-secret-token should not leak",
+    )
+    assert health["status"] == "error"
+    assert "\n" not in (health["last_error"] or "")
+    assert "sk-secret-token" not in (health["last_error"] or "")
+    assert "<redacted>" in (health["last_error"] or "")

@@ -2473,6 +2473,115 @@ def decompose_task_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# Dispatcher health (read-only runtime truth)
+# ---------------------------------------------------------------------------
+
+
+def _load_kanban_config() -> dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    return kanban_cfg if isinstance(kanban_cfg, dict) else {}
+
+
+def _read_only_board_dispatchability_summary() -> list[dict[str, Any]]:
+    """Return lightweight per-board dispatchability counts without mutations."""
+    try:
+        boards = kanban_db.list_boards(include_archived=False)
+    except Exception:
+        boards = [kanban_db.read_board_metadata(kanban_db.DEFAULT_BOARD)]
+    summaries: list[dict[str, Any]] = []
+    now = int(time.time())
+    for b in boards:
+        slug = b.get("slug") or kanban_db.DEFAULT_BOARD
+        path = kanban_db.kanban_db_path(slug)
+        if not path.exists():
+            summaries.append({
+                "board": slug,
+                "ready_total": 0,
+                "ready_dispatchable": 0,
+                "ready_claimed": 0,
+                "review_total": 0,
+                "review_dispatchable": 0,
+                "review_claimed": 0,
+                "stale_claim_candidates": 0,
+            })
+            continue
+        conn = None
+        try:
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT status, assignee, claim_lock, claim_expires FROM tasks "
+                "WHERE status IN ('ready', 'review')"
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        summary = {
+            "board": slug,
+            "ready_total": 0,
+            "ready_dispatchable": 0,
+            "ready_claimed": 0,
+            "review_total": 0,
+            "review_dispatchable": 0,
+            "review_claimed": 0,
+            "stale_claim_candidates": 0,
+        }
+        for row in rows:
+            status = row["status"]
+            assignee = (row["assignee"] or "").strip()
+            claimed = bool(row["claim_lock"])
+            expires = row["claim_expires"]
+            if status == "ready":
+                summary["ready_total"] += 1
+                if claimed:
+                    summary["ready_claimed"] += 1
+                elif assignee:
+                    summary["ready_dispatchable"] += 1
+            elif status == "review":
+                summary["review_total"] += 1
+                if claimed:
+                    summary["review_claimed"] += 1
+                elif assignee:
+                    summary["review_dispatchable"] += 1
+            try:
+                exp = int(expires) if expires is not None else None
+            except (TypeError, ValueError):
+                exp = None
+            if claimed and (exp is None or exp < now):
+                summary["stale_claim_candidates"] += 1
+        summaries.append(summary)
+    return summaries
+
+
+def _dispatcher_health_payload() -> dict[str, Any]:
+    kanban_cfg = _load_kanban_config()
+    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
+    dispatcher = kanban_db.read_dispatcher_health()
+    return {
+        "ok": True,
+        "auto_decompose": auto_decompose,
+        "dispatcher": dispatcher,
+        "boards": _read_only_board_dispatchability_summary(),
+    }
+
+
+@router.get("/dispatcher-health")
+def dispatcher_health():
+    """Return read-only dispatcher runtime health separate from config state."""
+    return _dispatcher_health_payload()
+
+
+# ---------------------------------------------------------------------------
 # Orchestration settings (kanban.orchestrator_profile / default_assignee /
 # auto_decompose) — surfaced to the dashboard's settings panel
 # ---------------------------------------------------------------------------
@@ -2486,14 +2595,13 @@ class OrchestrationSettingsBody(BaseModel):
 
 @router.get("/orchestration")
 def get_orchestration_settings():
-    """Return the current kanban orchestration knobs from config.yaml
-    plus the resolved effective values (filling in fallbacks)."""
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
-    except Exception:
-        cfg = {}
-    kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
+    """Return current kanban orchestration config plus runtime health.
+
+    ``auto_decompose`` is configuration. ``dispatcher_health`` is the
+    observed gateway dispatcher runtime state and may be unknown when the
+    dashboard process cannot observe the gateway's persisted health file.
+    """
+    kanban_cfg = _load_kanban_config()
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
@@ -2524,6 +2632,7 @@ def get_orchestration_settings():
         "resolved_orchestrator_profile": resolved_orch,
         "resolved_default_assignee": resolved_default,
         "active_profile": active_default,
+        "dispatcher_health": kanban_db.read_dispatcher_health(),
     }
 
 

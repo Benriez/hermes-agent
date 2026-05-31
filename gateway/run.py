@@ -5503,35 +5503,98 @@ class GatewayRunner:
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
         # as an escape hatch (false-y value disables without editing YAML).
         try:
-            from hermes_cli.config import load_config as _load_config
+            from hermes_cli import kanban_db as _kb_health
         except Exception:
+            _kb_health = None  # type: ignore[assignment]
+
+        def _record_dispatcher_health(**updates) -> None:
+            if _kb_health is None:
+                return
+            try:
+                _kb_health.write_dispatcher_health(**updates)
+            except Exception:
+                logger.debug("kanban dispatcher: failed to persist health state", exc_info=True)
+
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception as exc:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
+            _record_dispatcher_health(
+                enabled=False,
+                source="gateway",
+                status="disabled",
+                reason="config_loader_unavailable",
+                last_error_at=_kb_health._utc_iso_now() if _kb_health else None,
+                last_error=exc,
+                gateway_pid=os.getpid(),
+            )
             return
         env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
         if env_override in {"0", "false", "no", "off"}:
             logger.info("kanban dispatcher: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+            _record_dispatcher_health(
+                enabled=False,
+                source="gateway",
+                status="disabled",
+                reason="disabled_by_env",
+                gateway_pid=os.getpid(),
+            )
             return
 
         try:
             cfg = _load_config()
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
+            _record_dispatcher_health(
+                enabled=False,
+                source="gateway",
+                status="disabled",
+                reason="config_load_failed",
+                last_error_at=_kb_health._utc_iso_now() if _kb_health else None,
+                last_error=exc,
+                gateway_pid=os.getpid(),
+            )
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         if not kanban_cfg.get("dispatch_in_gateway", True):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
+            _record_dispatcher_health(
+                enabled=False,
+                source="gateway",
+                status="disabled",
+                reason="disabled_by_config",
+                gateway_pid=os.getpid(),
+            )
             return
 
         try:
-            from hermes_cli import kanban_db as _kb
-        except Exception:
+            _kb = _kb_health
+            if _kb is None:
+                from hermes_cli import kanban_db as _kb  # type: ignore[no-redef]
+        except Exception as exc:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+            _record_dispatcher_health(
+                enabled=False,
+                source="gateway",
+                status="disabled",
+                reason="kanban_db_unavailable",
+                last_error=exc,
+                gateway_pid=os.getpid(),
+            )
             return
 
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+        _record_dispatcher_health(
+            enabled=True,
+            source="gateway",
+            reason="dispatcher_started",
+            interval_seconds=interval,
+            gateway_pid=os.getpid(),
+            runtime_head=_kb._runtime_head(),
+        )
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -5993,6 +6056,7 @@ class GatewayRunner:
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
         while self._running:
+            tick_started = time.monotonic()
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -6010,8 +6074,12 @@ class GatewayRunner:
                 if auto_decompose_enabled:
                     await asyncio.to_thread(_auto_decompose_tick)
                 results = await asyncio.to_thread(_tick_once)
+                tick_at = _kb._utc_iso_now()
+                duration_ms = int((time.monotonic() - tick_started) * 1000)
+                last_board = None
                 any_spawned = False
                 for slug, res in (results or []):
+                    last_board = slug
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually
@@ -6058,10 +6126,35 @@ class GatewayRunner:
                             dispatchable, bad_ticks, excl_str,
                         )
                         last_warn_at = now
+                _record_dispatcher_health(
+                    enabled=True,
+                    source="gateway",
+                    last_tick_at=tick_at,
+                    last_success_at=tick_at,
+                    last_error_at=None,
+                    last_error=None,
+                    last_board=last_board,
+                    last_tick_duration_ms=duration_ms,
+                    interval_seconds=interval,
+                    gateway_pid=os.getpid(),
+                    runtime_head=_kb._runtime_head(),
+                )
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 raise
-            except Exception:
+            except Exception as exc:
+                _record_dispatcher_health(
+                    enabled=True,
+                    source="gateway",
+                    status="error",
+                    reason="last_tick_error",
+                    last_error_at=_kb._utc_iso_now(),
+                    last_error=exc,
+                    last_tick_duration_ms=int((time.monotonic() - tick_started) * 1000),
+                    interval_seconds=interval,
+                    gateway_pid=os.getpid(),
+                    runtime_head=_kb._runtime_head(),
+                )
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()

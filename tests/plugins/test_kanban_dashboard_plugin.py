@@ -98,20 +98,57 @@ def test_create_task_appears_on_board(client):
     task = r.json()["task"]
     assert task["title"] == "Research LLM caching"
     assert task["assignee"] == "researcher"
-    assert task["status"] == "ready"  # no parents -> immediately ready
+    assert task["status"] == "blocked"  # default is blocked (safe parking)
     assert task["priority"] == 3
     assert task["tenant"] == "acme"
+    assert task["body"] is None  # no body sent
     task_id = task["id"]
 
-    # Board now lists it under 'ready'.
+    # Board now lists it under 'blocked'.
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    ready = next(c for c in data["columns"] if c["name"] == "ready")
-    assert len(ready["tasks"]) == 1
-    assert ready["tasks"][0]["id"] == task_id
+    blocked = next(c for c in data["columns"] if c["name"] == "blocked")
+    assert len(blocked["tasks"]) == 1
+    assert blocked["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_task_with_initial_status_blocked(client):
+    """Explicit initial_status='blocked' creates a task in blocked state."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "safe task",
+            "initial_status": "blocked",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["title"] == "safe task"
+    assert task["status"] == "blocked"
+
+    r = client.get("/api/plugins/kanban/board")
+    blocked = next(c for c in r.json()["columns"] if c["name"] == "blocked")
+    assert any(t["id"] == task["id"] for t in blocked["tasks"])
+
+
+def test_create_task_with_body_description(client):
+    """Body/description text is stored when sent with create task."""
+    body_text = "This is a test description."
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "task with description",
+            "body": body_text,
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["title"] == "task with description"
+    assert task["body"] == body_text
+    assert task["status"] == "blocked"  # still defaults to blocked
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
@@ -258,7 +295,7 @@ def test_task_detail_includes_links_and_events(client):
     ).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "child", "parents": [parent["id"]]},
+        json={"title": "child", "parents": [parent["id"]], "initial_status": "running"},
     ).json()["task"]
     assert child["status"] == "todo"  # parent not done yet
 
@@ -305,7 +342,7 @@ def test_patch_status_complete(client):
 
 
 def test_patch_block_then_unblock(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x", "initial_status": "running"}).json()["task"]
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
         json={"status": "blocked", "block_reason": "need input"},
@@ -352,7 +389,7 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "c", "parents": [parent["id"]]},
+        json={"title": "c", "parents": [parent["id"]], "initial_status": "running"},
     ).json()["task"]
     assert child["status"] == "todo"
 
@@ -397,7 +434,7 @@ def test_reopening_parent_demotes_ready_child(client):
     parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "c", "parents": [parent["id"]]},
+        json={"title": "c", "parents": [parent["id"]], "initial_status": "running"},
     ).json()["task"]
     assert child["status"] == "todo"
 
@@ -631,7 +668,7 @@ def test_triage_task_not_promoted_to_ready(client):
 def test_patch_status_triage_works(client):
     """A user (or specifier) can push a task back into triage, and out of it."""
     t = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "x"},
+        "/api/plugins/kanban/tasks", json={"title": "x", "initial_status": "running"},
     ).json()["task"]
     # Normal creation is 'ready'; push to triage.
     r = client.patch(
@@ -659,11 +696,11 @@ def test_board_progress_rollup(client):
     ).json()["task"]
     child_a = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "a", "parents": [parent["id"]]},
+        json={"title": "a", "parents": [parent["id"]], "initial_status": "running"},
     ).json()["task"]
     child_b = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "b", "parents": [parent["id"]]},
+        json={"title": "b", "parents": [parent["id"]], "initial_status": "running"},
     ).json()["task"]
     # Children start as "todo" because the parent isn't done yet.  Set the
     # parent to done so children auto-promote to ready via recompute_ready.
@@ -1233,7 +1270,7 @@ def test_patch_status_done_without_summary_still_works(client):
 
 def test_patch_status_archive_closes_running_run(client):
     """PATCH to archived while running must close the in-flight run."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker", "initial_status": "running"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1260,7 +1297,7 @@ def test_patch_status_archive_closes_running_run(client):
 
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker", "initial_status": "running"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1350,7 +1387,7 @@ def test_create_task_includes_warning_when_no_dispatcher(client, monkeypatch):
     )
     r = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "warn-me", "assignee": "worker"},
+        json={"title": "warn-me", "assignee": "worker", "initial_status": "running"},
     )
     assert r.status_code == 200
     data = r.json()
@@ -2114,7 +2151,7 @@ def test_board_endpoint_accepts_explicit_board_default_param(client):
     # Create a task on the default board.
     t = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "on-default-board"},
+        json={"title": "on-default-board", "initial_status": "running"},
     ).json()["task"]
     assert t["status"] == "ready"
 
@@ -2193,3 +2230,92 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher health endpoint / UI truth
+# ---------------------------------------------------------------------------
+
+def test_dispatcher_health_endpoint_unknown_separates_auto_decompose(client):
+    r = client.get("/api/plugins/kanban/dispatcher-health")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["ok"] is True
+    assert data["auto_decompose"] is True
+    assert data["dispatcher"]["status"] == "unknown"
+    assert data["dispatcher"]["reason"] == "dispatcher_health_not_available"
+    assert data["dispatcher"]["status"] != "healthy"
+    assert isinstance(data.get("boards"), list)
+
+
+def test_dispatcher_health_endpoint_disabled_state(client):
+    kb.write_dispatcher_health(enabled=False, source="gateway", reason="disabled_by_config")
+    r = client.get("/api/plugins/kanban/dispatcher-health")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["dispatcher"]["available"] is True
+    assert data["dispatcher"]["enabled"] is False
+    assert data["dispatcher"]["status"] == "disabled"
+    assert data["dispatcher"]["reason"] == "disabled_by_config"
+
+
+def test_dispatcher_health_endpoint_error_sanitizes_text(client):
+    kb.write_dispatcher_health(
+        enabled=True,
+        source="gateway",
+        interval_seconds=60,
+        last_error_at=1000.0,
+        last_error="Traceback\nRuntimeError token=SECRET_VALUE failed",
+    )
+    r = client.get("/api/plugins/kanban/dispatcher-health")
+    assert r.status_code == 200, r.text
+    error = r.json()["dispatcher"]["last_error"]
+    assert r.json()["dispatcher"]["status"] == "error"
+    assert "\n" not in error
+    assert "SECRET_VALUE" not in error
+    assert "<redacted>" in error
+
+
+def test_dispatcher_health_endpoint_is_read_only_for_tasks(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "read only check"}).json()["task"]
+    before_conn = kb.connect()
+    try:
+        before = kb.get_task(before_conn, task["id"])
+    finally:
+        before_conn.close()
+    r = client.get("/api/plugins/kanban/dispatcher-health")
+    assert r.status_code == 200, r.text
+    after_conn = kb.connect()
+    try:
+        after = kb.get_task(after_conn, task["id"])
+    finally:
+        after_conn.close()
+    assert before is not None and after is not None
+    assert after.status == before.status
+    assert after.claim_lock == before.claim_lock
+    assert after.current_run_id == before.current_run_id
+
+
+def test_orchestration_payload_includes_dispatcher_health(client):
+    kb.write_dispatcher_health(enabled=False, source="gateway", reason="disabled_by_config")
+    r = client.get("/api/plugins/kanban/orchestration")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert "auto_decompose" in data
+    assert data["dispatcher_health"]["status"] == "disabled"
+    assert data["dispatcher_health"]["reason"] == "disabled_by_config"
+
+
+def test_dashboard_bundle_separates_auto_decompose_from_dispatcher_runtime():
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "Auto-decompose: " in js
+    assert "Dispatcher: " in js
+    assert "Runtime health is observed separately from Auto-decompose config" in js
+    assert "Unknown does not mean Healthy" in js
+    assert "Orchestration: Auto" not in js
+    assert "hermes-kanban-dispatcher-health--healthy" in css
+    assert "hermes-kanban-dispatcher-health--disabled" in css
+    assert "hermes-kanban-dispatcher-health--error" in css

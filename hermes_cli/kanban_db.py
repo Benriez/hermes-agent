@@ -247,6 +247,209 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
+# ---------------------------------------------------------------------------
+# Dispatcher runtime health (read-only observer surface)
+# ---------------------------------------------------------------------------
+
+_DISPATCHER_HEALTH_FILENAME = "dispatcher-health.json"
+_DISPATCHER_HEALTH_STALE_TOLERANCE_SECONDS = 5.0
+_DISPATCHER_HEALTH_ERROR_MAX_CHARS = 240
+_SECRETISH_RE = re.compile(
+    r"(?i)(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*[^\s,;]+"
+)
+
+
+def dispatcher_health_path() -> Path:
+    """Return the persisted gateway dispatcher-health JSON path.
+
+    The gateway and dashboard often run in separate processes, so in-memory
+    state cannot be trusted as the dashboard's source of truth. The embedded
+    gateway dispatcher writes this small JSON file; dashboard/API code reads it
+    without touching any Kanban task DB or starting workers.
+    """
+    return kanban_home() / "kanban" / _DISPATCHER_HEALTH_FILENAME
+
+
+def _utc_iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_health_ts(value: Any) -> Optional[float]:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        from datetime import datetime
+        return datetime.fromisoformat(text).timestamp()
+    except Exception:
+        return None
+
+
+def _sanitize_dispatcher_error(error: Any) -> Optional[str]:
+    """Return a short, single-line error with secret-looking values redacted."""
+    if error is None:
+        return None
+    text = str(error).replace("\n", " ").replace("\r", " ").strip()
+    if not text:
+        return None
+    text = _SECRETISH_RE.sub(lambda m: m.group(1) + "=<redacted>", text)
+    if len(text) > _DISPATCHER_HEALTH_ERROR_MAX_CHARS:
+        text = text[: _DISPATCHER_HEALTH_ERROR_MAX_CHARS - 1] + "…"
+    return text
+
+
+def _runtime_head() -> Optional[str]:
+    try:
+        repo = Path(__file__).resolve().parents[1]
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        head = (res.stdout or "").strip()
+        return head or None
+    except Exception:
+        return None
+
+
+def _base_dispatcher_health(*, enabled: Optional[bool], source: str = "gateway") -> dict[str, Any]:
+    return {
+        "available": True,
+        "enabled": enabled,
+        "source": source,
+        "status": "unknown",
+        "reason": "dispatcher_health_initializing",
+        "last_tick_at": None,
+        "last_success_at": None,
+        "last_error_at": None,
+        "last_error": None,
+        "last_board": None,
+        "last_tick_duration_ms": None,
+        "interval_seconds": None,
+        "gateway_pid": os.getpid(),
+        "runtime_head": _runtime_head(),
+        "process_started_at": _utc_iso_now(),
+    }
+
+
+def evaluate_dispatcher_health(data: Optional[dict[str, Any]], *, now: Optional[float] = None) -> dict[str, Any]:
+    """Normalize raw dispatcher health JSON into the public health contract."""
+    if not isinstance(data, dict):
+        return {
+            "available": False,
+            "enabled": None,
+            "source": "unknown",
+            "status": "unknown",
+            "reason": "dispatcher_health_not_available",
+            "last_tick_at": None,
+            "last_success_at": None,
+            "last_error_at": None,
+            "last_error": None,
+            "last_board": None,
+            "last_tick_duration_ms": None,
+            "interval_seconds": None,
+            "gateway_pid": None,
+            "runtime_head": None,
+            "process_started_at": None,
+        }
+
+    out = _base_dispatcher_health(enabled=data.get("enabled"), source=str(data.get("source") or "gateway"))
+    out.update({k: data.get(k, out.get(k)) for k in out.keys()})
+    out["last_error"] = _sanitize_dispatcher_error(out.get("last_error"))
+
+    if out.get("enabled") is False:
+        out["status"] = "disabled"
+        out["reason"] = str(data.get("reason") or "dispatcher_disabled")
+        return out
+
+    if now is None:
+        now = time.time()
+    interval = out.get("interval_seconds")
+    try:
+        interval_f = float(interval) if interval is not None else None
+    except (TypeError, ValueError):
+        interval_f = None
+
+    last_tick_ts = _parse_health_ts(out.get("last_tick_at"))
+    last_success_ts = _parse_health_ts(out.get("last_success_at"))
+    last_error_ts = _parse_health_ts(out.get("last_error_at"))
+
+    if last_error_ts is not None and (last_success_ts is None or last_error_ts > last_success_ts):
+        out["status"] = "error"
+        out["reason"] = str(data.get("reason") or "last_tick_error")
+        return out
+
+    if last_tick_ts is None:
+        out["status"] = "unknown"
+        out["reason"] = str(data.get("reason") or "dispatcher_no_tick_yet")
+        return out
+
+    if interval_f and interval_f > 0:
+        stale_after = (2.0 * interval_f) + _DISPATCHER_HEALTH_STALE_TOLERANCE_SECONDS
+        if now - last_tick_ts > stale_after:
+            out["status"] = "stale"
+            out["reason"] = "last_tick_stale"
+            return out
+
+    out["status"] = "healthy"
+    out["reason"] = "last_tick_recent"
+    return out
+
+
+def write_dispatcher_health(**updates: Any) -> dict[str, Any]:
+    """Persist dispatcher health updates atomically for dashboard readers."""
+    path = dispatcher_health_path()
+    existing: dict[str, Any] = {}
+    try:
+        if path.exists():
+            existing = json.loads(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        existing = {}
+    data = _base_dispatcher_health(enabled=updates.get("enabled", existing.get("enabled")))
+    data.update(existing)
+    data.update(updates)
+    if "last_error" in data:
+        data["last_error"] = _sanitize_dispatcher_error(data.get("last_error"))
+    data["updated_at"] = _utc_iso_now()
+    normalized = evaluate_dispatcher_health(data)
+    data["status"] = normalized.get("status")
+    data["reason"] = normalized.get("reason")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+    return evaluate_dispatcher_health(data)
+
+
+def read_dispatcher_health() -> dict[str, Any]:
+    """Read and normalize persisted dispatcher health; never mutates tasks."""
+    path = dispatcher_health_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return evaluate_dispatcher_health(None)
+    except Exception as exc:
+        return {
+            **evaluate_dispatcher_health(None),
+            "available": False,
+            "source": "not_available",
+            "status": "not_available",
+            "reason": "dispatcher_health_unreadable",
+            "last_error": _sanitize_dispatcher_error(exc),
+        }
+    return evaluate_dispatcher_health(data)
+
+
 def current_board_path() -> Path:
     """Return the path to ``<root>/kanban/current``.
 
