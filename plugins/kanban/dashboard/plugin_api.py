@@ -54,6 +54,9 @@ from pydantic import BaseModel, Field
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
 
+from agent.context_compressor import resolve_context_budget
+from agent.model_metadata import estimate_tokens_rough, DEFAULT_CONTEXT_LENGTHS
+
 log = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -582,6 +585,7 @@ class CreateTaskBody(BaseModel):
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
+    initial_status: str = "blocked"
 
 
 @router.post("/tasks")
@@ -589,6 +593,10 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        # When triage is explicitly True, the blocked default would
+        # override it in kanban_db. Let the normal status computation
+        # handle triage instead.
+        initial_status = "running" if payload.triage else payload.initial_status
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
@@ -604,6 +612,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
+            initial_status=initial_status,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -1026,6 +1035,42 @@ def _fallback_chain_from_config(cfg: dict[str, Any]) -> Optional[list[Any]]:
     return None
 
 
+def _resolve_preview_context_length(
+    model_cfg: dict[str, Any],
+    cfg: dict[str, Any],
+    effective_model: Optional[str],
+) -> int:
+    """Resolve model context length for route preview display.
+
+    Order of precedence (matches get_model_context_length conventions):
+    1. Explicit ``context_length`` in the profile model section
+    2. Explicit ``context_length`` at the profile config top level
+    3. Fuzzy match against DEFAULT_CONTEXT_LENGTHS using effective model name
+    4. Default fallback: 256K
+    """
+    # 1. Profile model section override
+    raw = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+    if isinstance(raw, int) and raw > 0:
+        return raw
+
+    # 2. Top-level profile config override
+    raw = cfg.get("context_length") if isinstance(cfg, dict) else None
+    if isinstance(raw, int) and raw > 0:
+        return raw
+
+    # 3. Fuzzy match against known model defaults (longest key first)
+    if effective_model:
+        model_lower = effective_model.lower()
+        for default_model, length in sorted(
+            DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
+        ):
+            if default_model in model_lower:
+                return length
+
+    # 4. Default fallback — 256K (matching CONTEXT_PROBE_TIERS[0])
+    return 256_000
+
+
 def _build_route_preview(task: kanban_db.Task, board: Optional[str]) -> dict[str, Any]:
     warnings: list[str] = []
     profile = task.assignee or None
@@ -1053,6 +1098,23 @@ def _build_route_preview(task: kanban_db.Task, board: Optional[str]) -> dict[str
         cmd.extend(["-m", model_override])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
 
+    # ── Context budget fields ──────────────────────────────────────────
+    ctx = _resolve_preview_context_length(model_cfg, cfg, effective_model)
+    budget = resolve_context_budget(context_length=ctx)
+
+    task_body = (task.body or "").strip()
+    task_body_chars = len(task_body)
+    estimated_task_tokens = estimate_tokens_rough(task_body)
+
+    context_warning: Optional[str] = None
+    if estimated_task_tokens > budget.input_budget:
+        context_warning = (
+            f"Task body (~{estimated_task_tokens:,} tokens) exceeds "
+            f"input budget (~{budget.input_budget:,} tokens); "
+            f"body+budget may overflow model context"
+        )
+        warnings.append(context_warning)
+
     return {
         "task_id": task.id,
         "board": board or kanban_db.get_current_board(),
@@ -1066,6 +1128,14 @@ def _build_route_preview(task: kanban_db.Task, board: Optional[str]) -> dict[str
         "fallback_providers": fallback_providers,
         "command_preview": shlex.join(cmd),
         "warnings": warnings,
+        # ── Context budget fields ──
+        "model_context_length": budget.context_length,
+        "input_budget": budget.input_budget,
+        "output_reserve": budget.reserved_output_tokens,
+        "safety_margin": budget.safety_margin,
+        "task_body_chars": task_body_chars,
+        "estimated_task_tokens": estimated_task_tokens,
+        "context_warning": context_warning,
     }
 
 

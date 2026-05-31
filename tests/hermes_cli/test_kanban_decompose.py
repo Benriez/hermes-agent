@@ -58,8 +58,16 @@ def _patch_extra_body():
 def _patch_list_profiles(names: list[str]):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
-    profiles_mod.profile_exists() to resolve orchestrator/default."""
+    profiles_mod.profile_exists() to resolve orchestrator/default.
+
+    Patches through ``kanban_decompose.profiles_mod`` directly (not via
+    ``hermes_cli.profiles`` string path) so the patches always hit the
+    exact module object the decomposer code uses, even when an earlier
+    test fixture has removed/re-imported ``hermes_cli`` submodules from
+    ``sys.modules``.
+    """
     from types import SimpleNamespace
+    import hermes_cli.kanban_decompose as _kd
     fake_profiles = [
         SimpleNamespace(
             name=n, is_default=(i == 0), description=f"desc for {n}",
@@ -67,10 +75,11 @@ def _patch_list_profiles(names: list[str]):
         )
         for i, n in enumerate(names)
     ]
+    pm = _kd.profiles_mod
     return [
-        patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
-        patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
-        patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
+        patch.object(pm, "list_profiles", return_value=fake_profiles),
+        patch.object(pm, "profile_exists", side_effect=lambda x: x in names),
+        patch.object(pm, "get_active_profile_name", return_value=names[0] if names else "default"),
     ]
 
 
