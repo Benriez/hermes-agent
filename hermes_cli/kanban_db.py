@@ -3149,6 +3149,107 @@ def release_stale_claims(
                 },
             )
 
+    # Ready + NULL claim_expires — no TTL to expire so has been invisible
+    # since the stale lock was set.  Clear immediately.
+    ready_null = conn.execute(
+        "SELECT id, claim_lock, worker_pid FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NOT NULL "
+        "  AND claim_expires IS NULL",
+    ).fetchall()
+    for row in ready_null:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status = 'ready' AND claim_lock IS ? "
+                "  AND claim_expires IS NULL",
+                (row["id"], row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            reclaimed += 1
+            _append_event(
+                conn, row["id"], "stale_claim_cleared",
+                {
+                    "reason": "null_claim_expiry",
+                    "old_status": "ready",
+                    "old_claim_lock": row["claim_lock"],
+                    "old_worker_pid": row["worker_pid"],
+                    "source": "release_stale_claims",
+                    "now": now,
+                },
+            )
+
+    # Review tasks — dispatchable by review workers via
+    # "status='review' AND claim_lock IS NULL".  A stale claim_lock
+    # makes them permanently invisible.
+    review_stale = conn.execute(
+        "SELECT id, claim_lock, worker_pid, claim_expires FROM tasks "
+        "WHERE status = 'review' AND claim_lock IS NOT NULL "
+        "  AND (claim_expires IS NULL OR claim_expires < ?)",
+        (now,),
+    ).fetchall()
+    for row in review_stale:
+        reason = "null_claim_expiry" if row["claim_expires"] is None else "expired_claim"
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status = 'review' AND claim_lock IS ? "
+                "  AND (claim_expires IS NULL OR claim_expires < ?)",
+                (row["id"], row["claim_lock"], now),
+            )
+            if cur.rowcount != 1:
+                continue
+            reclaimed += 1
+            _append_event(
+                conn, row["id"], "stale_claim_cleared",
+                {
+                    "reason": reason,
+                    "old_status": "review",
+                    "old_claim_lock": row["claim_lock"],
+                    "old_claim_expires": row["claim_expires"],
+                    "old_worker_pid": row["worker_pid"],
+                    "source": "release_stale_claims",
+                    "now": now,
+                },
+            )
+
+    # Non-active statuses — claim fields are stale metadata that can
+    # poison future transitions.  Only clean when no active run exists
+    # (current_run_id IS NULL) so we never interfere with an in-flight
+    # worker that happens to have a non-running status due to a bug.
+    _NON_ACTIVE_STATUSES = ("blocked", "todo", "triage", "scheduled", "done", "archived")
+    non_active = conn.execute(
+        "SELECT id, status, claim_lock, worker_pid FROM tasks "
+        "WHERE status IN ('blocked', 'todo', 'triage', 'scheduled', 'done', 'archived') "
+        "  AND claim_lock IS NOT NULL "
+        "  AND current_run_id IS NULL",
+    ).fetchall()
+    for row in non_active:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL "
+                "WHERE id = ? AND status = ? AND claim_lock IS ? "
+                "  AND current_run_id IS NULL",
+                (row["id"], row["status"], row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            reclaimed += 1
+            _append_event(
+                conn, row["id"], "stale_claim_cleared",
+                {
+                    "reason": "non_active_status_claim",
+                    "old_status": row["status"],
+                    "old_claim_lock": row["claim_lock"],
+                    "old_worker_pid": row["worker_pid"],
+                    "source": "release_stale_claims",
+                    "now": now,
+                },
+            )
+
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "

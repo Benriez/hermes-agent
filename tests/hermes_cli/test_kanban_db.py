@@ -592,6 +592,260 @@ def test_release_stale_claims_clears_ready_claimed_locks(
         assert payload["worker_pid_was"] == 99999
 
 
+def test_release_stale_claims_clears_ready_null_expiry(kanban_home, monkeypatch):
+    """release_stale_claims must clear claim_lock on ready tasks with NULL
+    claim_expires — no TTL means the task can never auto-recover."""
+    import json
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', "
+            "claim_lock = ?, claim_expires = NULL, worker_pid = ? "
+            "WHERE id = ?",
+            (f"{host}:deadworker", 99999, t),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_claim_cleared'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["reason"] == "null_claim_expiry"
+        assert payload["old_status"] == "ready"
+        assert payload["source"] == "release_stale_claims"
+
+        # Idempotence: second call does nothing.
+        reclaimed2 = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed2 == 0
+
+        events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'stale_claim_cleared'",
+            (t,),
+        ).fetchone()[0]
+        assert events == 1
+
+
+def test_release_stale_claims_clears_review_expired(kanban_home, monkeypatch):
+    """release_stale_claims must clear stale claim_lock on review tasks
+    with expired claim_expires."""
+    import json
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        _set_task_status(conn, t, "review")
+
+        conn.execute(
+            "UPDATE tasks SET "
+            "claim_lock = ?, claim_expires = ?, worker_pid = ? "
+            "WHERE id = ?",
+            (f"{host}:reviewer", int(time.time()) - 3600, 88888, t),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_claim_cleared'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["reason"] == "expired_claim"
+        assert payload["old_status"] == "review"
+
+        # Idempotence
+        reclaimed2 = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed2 == 0
+
+
+def test_release_stale_claims_clears_review_null_expiry(kanban_home, monkeypatch):
+    """release_stale_claims must clear claim_lock on review tasks with
+    NULL claim_expires."""
+    import json
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        _set_task_status(conn, t, "review")
+
+        conn.execute(
+            "UPDATE tasks SET "
+            "claim_lock = ?, claim_expires = NULL, worker_pid = ? "
+            "WHERE id = ?",
+            (f"{host}:reviewer", 88888, t),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_claim_cleared'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["reason"] == "null_claim_expiry"
+        assert payload["old_status"] == "review"
+
+        # Idempotence
+        reclaimed2 = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed2 == 0
+
+
+@pytest.mark.parametrize("status", ("blocked", "todo", "triage", "scheduled", "done", "archived"))
+def test_release_stale_claims_clears_non_active_statuses(status, kanban_home, monkeypatch):
+    """release_stale_claims must clear stale claim fields on non-active
+    statuses when there is no active run (current_run_id IS NULL)."""
+    import json
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        _set_task_status(conn, t, status)
+
+        conn.execute(
+            "UPDATE tasks SET "
+            "claim_lock = ?, claim_expires = ?, worker_pid = ?, "
+            "current_run_id = NULL "
+            "WHERE id = ?",
+            (f"{host}:stale", 42, 77777, t),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        task = kb.get_task(conn, t)
+        assert task.status == status  # status unchanged
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+
+        row = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'stale_claim_cleared'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row["payload"])
+        assert payload["reason"] == "non_active_status_claim"
+        assert payload["old_status"] == status
+
+        # Idempotence
+        reclaimed2 = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed2 == 0
+
+
+def test_release_stale_claims_does_not_clear_running_null_expiry(kanban_home, monkeypatch):
+    """release_stale_claims must NOT blindly clear running tasks with
+    NULL claim_expires — live-worker safety is preserved."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:live")
+        kb._set_worker_pid(conn, t, os.getpid())
+
+        # Set claim_expires to NULL to simulate the pathological case.
+        conn.execute("UPDATE tasks SET claim_expires = NULL WHERE id = ?", (t,))
+        conn.commit()
+
+        # Verify the task is running.
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        assert task.claim_expires is None
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        # Should NOT reclaim a running task with NULL claim_expires.
+        assert reclaimed == 0
+
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.claim_lock is not None
+        assert task.worker_pid is not None
+
+
+def test_dispatch_visibility_after_null_expiry_recovery(kanban_home, monkeypatch):
+    """A ready task with claim_lock and NULL claim_expires should be
+    dispatchable (via claim_task) AFTER release_stale_claims clears
+    the stale lock."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', "
+            "claim_lock = ?, claim_expires = NULL, worker_pid = ? "
+            "WHERE id = ?",
+            (f"{host}:stale", 99999, t),
+        )
+        conn.commit()
+
+        # Before recovery: claim_task should fail (claim_lock blocks it).
+        assert kb.claim_task(conn, t) is None
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+
+        # After recovery: claim_task should succeed.
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.status == "running"
+        assert claimed.claim_lock is not None
+
+
 def test_detect_crashed_workers_systemic_failure_fast_block(
     kanban_home, monkeypatch,
 ):
