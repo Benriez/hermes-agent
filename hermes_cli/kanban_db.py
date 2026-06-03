@@ -2152,6 +2152,410 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_FORBIDDEN_KANBAN_WORKER_ASSIGNEES = {"superhermes", "local-implementer", "local-reviewer"}
+_CONTROL_PLANE_ASSIGNEE_PREFIXES = ("orion-",)
+
+
+def _kanban_assignee_validation_enabled() -> bool:
+    """Return True when Kanban assignee writes should be production-validated.
+
+    Pytest uses isolated temporary Hermes homes without real profile
+    directories, and many historical tests intentionally use fixture
+    assignees such as ``alice`` and ``worker``. Prefer explicit pytest
+    detection over the previous ``HERMES_HOME.startswith('/tmp')``
+    heuristic; tests can opt into production validation with
+    ``HERMES_KANBAN_VALIDATE_ASSIGNEES=1``.
+    """
+    override = os.environ.get("HERMES_KANBAN_VALIDATE_ASSIGNEES")
+    if override is not None:
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return not bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _is_valid_kanban_assignee(
+    assignee: Optional[str],
+    *,
+    allow_default: bool = True,
+    allow_control_plane: bool = True,
+) -> bool:
+    """Kanban-specific assignee validity predicate."""
+    assignee = _canonical_assignee(assignee)
+    if assignee is None:
+        return True
+    if assignee in _FORBIDDEN_KANBAN_WORKER_ASSIGNEES:
+        return False
+    if any(assignee.startswith(prefix) for prefix in _CONTROL_PLANE_ASSIGNEE_PREFIXES):
+        return allow_control_plane
+    if not _kanban_assignee_validation_enabled():
+        return True
+    if assignee == "default":
+        return allow_default
+    try:
+        from hermes_cli import profiles as _profiles
+        return bool(_profiles.profile_exists(assignee))
+    except Exception:
+        return False
+
+
+def _is_spawnable_kanban_assignee(assignee: Optional[str]) -> bool:
+    """Return True iff assignee is a concrete profile suitable for auto-spawn."""
+    assignee = _canonical_assignee(assignee)
+    if assignee is None or assignee == "default":
+        return False
+    if assignee in _FORBIDDEN_KANBAN_WORKER_ASSIGNEES:
+        return False
+    if any(assignee.startswith(prefix) for prefix in _CONTROL_PLANE_ASSIGNEE_PREFIXES):
+        return False
+    try:
+        from hermes_cli import profiles as _profiles
+        return bool(_profiles.profile_exists(assignee))
+    except Exception:
+        return False
+
+
+def _check_hardcoded_worker_enforcement(
+    assignee: str,
+    dispatch_type: str,
+) -> Optional[str]:
+    """Check hardcoded worker profile enforcement rules.
+
+    These rules are **not** config-based the way forbidden_profiles from
+    the task body is — they are intrinsic invariants of the Hermes multi-
+    agent architecture.  Violations mean the task or config is mis-wired
+    and the worker must not be spawned.
+
+    ``minimax-implementer`` is a review-only profile and must not be used
+    for implementation work.
+
+    ``deep-implementer`` is an implementation-only profile and must not
+    be used for review work unless explicitly configured as fallback via
+    ``kanban.review_fallback_assignee`` in config.yaml.
+
+    Returns ``None`` when the check passes, or a diagnostic string when
+    the assignee violates an enforcement rule (the caller should block).
+    """
+    _assignee_stripped = (assignee or "").strip()
+
+    if _assignee_stripped == "superhermes":
+        return (
+            "SUPERHERMES_ASSIGNEE_FORBIDDEN: superhermes is a Prism/plugin "
+            "analysis context, not a worker profile — blocked by hardcoded enforcement"
+        )
+
+    if dispatch_type == "implementation" and _assignee_stripped == "minimax-implementer":
+        return (
+            "MINIMAX_IMPLEMENTER_IMPLEMENTATION_BLOCKED: minimax-implementer "
+            "is a review-only profile and must not be used for implementation work"
+        )
+
+    if dispatch_type == "review" and _assignee_stripped == "deep-implementer":
+        # Allow through only when explicitly configured as review fallback.
+        try:
+            from hermes_cli.config import load_config as _review_fb_load
+            _fb_cfg = _review_fb_load()
+            _fb_kanban = _fb_cfg.get("kanban") or {}
+            if _fb_kanban.get("review_fallback_assignee") == "deep-implementer":
+                _log.warning(
+                    "Enforcement override: deep-implementer routed to review "
+                    "task — kanban.review_fallback_assignee=deep-implementer "
+                    "in config.yaml"
+                )
+                return None
+        except Exception:
+            pass
+        return (
+            "DEEP_IMPLEMENTER_REVIEW_BLOCKED: deep-implementer is an "
+            "implementation-only profile and must not be used for review work. "
+            "To use deep-implementer as a review fallback, set "
+            "kanban.review_fallback_assignee to 'deep-implementer' in config.yaml"
+        )
+
+    return None
+
+
+def _validate_kanban_assignee(
+    assignee: Optional[str],
+    *,
+    allow_default: bool = True,
+    allow_control_plane: bool = True,
+    field: str = "assignee",
+) -> Optional[str]:
+    """Canonicalize and validate a Kanban assignee before writing it."""
+    assignee = _canonical_assignee(assignee)
+    if not _is_valid_kanban_assignee(
+        assignee,
+        allow_default=allow_default,
+        allow_control_plane=allow_control_plane,
+    ):
+        default_note = " (default is not allowed for this worker route)" if assignee == "default" and not allow_default else ""
+        raise ValueError(
+            f"{field} {assignee!r} is not a valid Kanban worker profile{default_note}. "
+            "Use None for unassigned, or pick a real worker profile from `hermes profile list`."
+        )
+    return assignee
+
+
+def _is_qwopus_or_local_endpoint(value: Optional[str]) -> bool:
+    """Return True for localhost/RFC1918/Tailscale llama-swap style endpoints."""
+    if not value:
+        return False
+    text = str(value).strip().lower()
+    if not text:
+        return False
+    if "localhost" in text or "127.0.0.1" in text or "[::1]" in text:
+        return True
+    if "100.76.9.100" in text:
+        return True
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+
+        parsed = urlparse(text if "://" in text else f"http://{text}")
+        host = (parsed.hostname or "").strip("[]")
+        if not host:
+            return False
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_private or ip.is_loopback)
+    except Exception:
+        return False
+
+
+def _is_qwopus_or_local_provider(value: Optional[str]) -> bool:
+    """Return True for provider aliases known to route to local/qwopus backends."""
+    if not value:
+        return False
+    text = str(value).strip().lower()
+    if not text:
+        return False
+    needles = (
+        "ollama",
+        "llama.cpp",
+        "llamacpp",
+        "llama-cpp",
+        "vllm",
+        "qwopus",
+        "llama-swap",
+        "pi-4",
+        "localhost",
+        "local-ollama",
+    )
+    return any(n in text for n in needles)
+
+
+def _load_profile_config_for_guard(profile: str) -> dict:
+    """Load a profile config for Quick-worker local/qwopus route guards."""
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore[assignment]
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    path = home / "profiles" / str(profile) / "config.yaml"
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    if yaml is not None:
+        data = yaml.safe_load(text) or {}
+        return data if isinstance(data, dict) else {}
+    # Extremely small fallback for environments without PyYAML.
+    data: dict[str, Any] = {}
+    current: dict[str, Any] | None = None
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if not raw.startswith(" ") and ":" in raw:
+            key, val = raw.split(":", 1)
+            key = key.strip()
+            val = val.strip()
+            if val:
+                data[key] = val
+                current = None
+            else:
+                current = data[key] = {}
+        elif current is not None and ":" in raw:
+            key, val = raw.split(":", 1)
+            current[key.strip()] = val.strip()
+    return data
+
+
+def _scan_profile_for_qwopus_route(cfg: dict) -> Optional[str]:
+    """Strict primary-route guard used by dispatcher."""
+    model = cfg.get("model") if isinstance(cfg, dict) else None
+    if not isinstance(model, dict):
+        return None
+    provider = model.get("provider")
+    base_url = model.get("base_url") or model.get("api")
+    default_model = model.get("default") or model.get("model") or model.get("default_model")
+    if _is_qwopus_or_local_provider(provider):
+        return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: primary provider {provider!r}"
+    if _is_qwopus_or_local_endpoint(base_url):
+        return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: primary base_url {base_url!r}"
+    if _is_qwopus_or_local_provider(default_model):
+        return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: primary model {default_model!r}"
+    return None
+
+
+def _scan_dormant_local_route(cfg: dict) -> Optional[str]:
+    """Strict diagnostic scan for dormant local/qwopus route seeds."""
+    if not isinstance(cfg, dict):
+        return None
+    primary = _scan_profile_for_qwopus_route(cfg)
+    if primary:
+        return primary
+
+    custom = cfg.get("custom_providers")
+    if isinstance(custom, list):
+        for item in custom:
+            if not isinstance(item, dict):
+                continue
+            for key in ("model", "default_model", "base_url", "api", "provider", "name"):
+                val = item.get(key)
+                if _is_qwopus_or_local_provider(val) or _is_qwopus_or_local_endpoint(val):
+                    return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: custom_providers.{key} {val!r}"
+
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        for name, item in providers.items():
+            if _is_qwopus_or_local_provider(name):
+                return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: providers {name!r}"
+            if isinstance(item, dict):
+                for key in ("model", "default_model", "base_url", "api", "provider", "name"):
+                    val = item.get(key)
+                    if _is_qwopus_or_local_provider(val) or _is_qwopus_or_local_endpoint(val):
+                        return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: providers.{key} {val!r}"
+
+    auxiliary = cfg.get("auxiliary")
+    if isinstance(auxiliary, dict):
+        for aux_name, item in auxiliary.items():
+            if not isinstance(item, dict):
+                continue
+            for key in ("provider", "base_url", "api", "model", "default_model"):
+                val = item.get(key)
+                if _is_qwopus_or_local_provider(val) or _is_qwopus_or_local_endpoint(val):
+                    return f"QUICK_WORKER_LOCAL_OR_QWOPUS_ROUTE_BLOCKED: auxiliary.{aux_name}.{key} {val!r}"
+    return None
+
+
+def _task_body_skips_review(body: Optional[str]) -> bool:
+    """Return True when a task body explicitly opts out of review routing."""
+    if not body:
+        return False
+    lowered = str(body).lower()
+    return (
+        "card_collection_only" in lowered
+        or "skip_review: true" in lowered
+        or "skip_review=true" in lowered
+        or "review_required: false" in lowered
+        or "review_required=false" in lowered
+    )
+
+
+def _build_audit_rework_body(
+    *,
+    source_task_id: str,
+    source_title: str,
+    findings: Optional[str],
+    required_changes: Optional[str],
+    fallback_summary: Optional[str],
+    assignee: Optional[str],
+) -> str:
+    findings_text = (findings or fallback_summary or "Audit failed; rework required.").strip()
+    required_text = (required_changes or "Address the audit findings and resubmit for review.").strip()
+    return (
+        f"REWORK source_task: {source_task_id}\n"
+        f"source_title: {source_title}\n"
+        f"preferred_profiles: [deep-implementer]\n"
+        "forbidden_profiles: [local-implementer, local-reviewer]\n"
+        "required_prism_context: superhermes\n"
+        "required_skills: prism-full\n"
+        "review_required: true\n"
+        "prism: fix only the audit findings; preserve accepted behavior.\n\n"
+        f"Findings:\n{findings_text}\n\n"
+        f"Required changes:\n{required_text}\n"
+    )
+
+
+def _ensure_audit_rework_card_txn(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    source_title: str,
+    assignee: Optional[str],
+    findings: Optional[str],
+    required_changes: Optional[str],
+    fallback_summary: Optional[str],
+    now: int,
+) -> str:
+    """Create or return the deterministic REWORK child for an audit fail.
+
+    Called inside an existing write transaction; therefore it performs raw
+    INSERTs instead of calling create_task()/link_tasks(), both of which open
+    their own write transactions. The child is intentionally ``ready`` even
+    though the source task is blocked.
+    """
+    existing = conn.execute(
+        """
+        SELECT t.id
+          FROM task_links l
+          JOIN tasks t ON t.id = l.child_id
+         WHERE l.parent_id = ?
+           AND t.status != 'archived'
+           AND (t.title LIKE 'REWORK:%' OR t.title LIKE 'REWORK %')
+         ORDER BY t.created_at ASC
+         LIMIT 1
+        """,
+        (source_task_id,),
+    ).fetchone()
+    if existing:
+        return existing["id"]
+
+    rework_assignee = _validate_kanban_assignee(
+        assignee,
+        allow_default=False,
+        allow_control_plane=False,
+    ) if assignee else None
+    rework_id = _new_task_id()
+    rework_title = f"REWORK: {source_title}"[:240]
+    rework_body = _build_audit_rework_body(
+        source_task_id=source_task_id,
+        source_title=source_title,
+        findings=findings,
+        required_changes=required_changes,
+        fallback_summary=fallback_summary,
+        assignee=rework_assignee,
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (
+            id, title, body, assignee, status, priority,
+            created_by, created_at, workspace_kind
+        ) VALUES (?, ?, ?, ?, 'ready', 0, 'system', ?, 'scratch')
+        """,
+        (rework_id, rework_title, rework_body, rework_assignee, now),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        (source_task_id, rework_id),
+    )
+    _append_event(
+        conn,
+        rework_id,
+        "created",
+        {
+            "assignee": rework_assignee,
+            "status": "ready",
+            "parents": [source_task_id],
+            "source": "audit_fail_rework",
+        },
+    )
+    _append_event(
+        conn,
+        source_task_id,
+        "rework_created",
+        {"rework_task_id": rework_id},
+    )
+    return rework_id
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2198,7 +2602,7 @@ def create_task(
     (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
     """
-    assignee = _canonical_assignee(assignee)
+    assignee = _validate_kanban_assignee(assignee, allow_default=True)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2299,6 +2703,10 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Best-effort race reduction: profile directories live outside
+                # SQLite, so revalidate immediately before the INSERT as well
+                # as at function entry.
+                _validate_kanban_assignee(assignee, allow_default=True)
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -2477,7 +2885,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
     """
-    profile = _canonical_assignee(profile)
+    profile = _validate_kanban_assignee(profile, allow_default=True)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -3409,6 +3817,24 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    # Hardcoded worker enforcement: reject claims from/for profiles that
+    # violate intrinsic invariants.  deep-implementer is an
+    # implementation-only profile and must not be used for review work
+    # unless explicitly configured as fallback.
+    _review_task_assignee = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ? AND status = 'review'",
+        (task_id,),
+    ).fetchone()
+    if _review_task_assignee and _review_task_assignee["assignee"]:
+        _review_enforce = _check_hardcoded_worker_enforcement(
+            _review_task_assignee["assignee"], dispatch_type="review",
+        )
+        if _review_enforce is not None:
+            _log.warning(
+                "Review claim blocked for task %s: %s",
+                task_id, _review_enforce,
+            )
+            return None
     with write_txn(conn):
         cur = conn.execute(
             """
@@ -4063,43 +4489,151 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Determine target status.
+    # Priority:
+    #   1. review_outcome metadata from review agent:
+    #      "pass" → done, "fail" → blocked (source blocked, REWORK card created)
+    #   2. implementation_assignee completion → review (when config allows)
+    #   3. Everything else → done
+    trow = conn.execute("SELECT assignee, title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    try:
+        from hermes_cli.config import load_config as _ct_load_config
+        _kanban_cfg = (_ct_load_config().get("kanban") or {})
+    except Exception:
+        _kanban_cfg = {}
+    _impl_assignee = _canonical_assignee(_kanban_cfg.get("implementation_assignee") or "deep-implementer")
+    _require_review = _kanban_cfg.get("require_review_after_implementation", True)
+    _review_assignee = _canonical_assignee(_kanban_cfg.get("review_assignee") or "minimax-implementer")
+    review_outcome = (metadata or {}).get("review_outcome") if isinstance(metadata, dict) else None
+
+    # Explicit body-level review opt-outs for admin/cleanup/rollback cards.
+    _skip_review = _task_body_skips_review(trow["body"] if trow else None)
+
+    if review_outcome == "fail":
+        target_status = "blocked"
+    elif review_outcome == "pass":
+        target_status = "done"
+    elif trow and _require_review and not _skip_review and trow["assignee"] == _impl_assignee:
+        target_status = "review"
+    else:
+        target_status = "done"
+
+    target_assignee: Optional[str] = None
+    is_review_transition = (target_status == "review")
+    if is_review_transition:
+        target_assignee = _review_assignee
+        # Fork-safe guards: never route to superhermes (Prism context,
+        # not a worker profile), local-implementer, local-reviewer, or any
+        # non-existent/non-spawnable profile. Fall back to minimax, then
+        # validate immediately before the SQL write.
+        if not _is_valid_kanban_assignee(
+            target_assignee,
+            allow_default=False,
+            allow_control_plane=False,
+        ):
+            target_assignee = "minimax-implementer"
+        target_assignee = _validate_kanban_assignee(
+            target_assignee,
+            allow_default=False,
+            allow_control_plane=False,
+            field="review_assignee",
+        )
+
     with write_txn(conn):
+        # audit_outcome overrides status routing: when review_outcome is
+        # set, allow transition from 'review' (not just running/ready/blocked).
+        _audit_override = review_outcome in ("pass", "fail")
         if expected_run_id is None:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                """,
-                (result, now, task_id),
-            )
+            if is_review_transition and target_assignee is not None:
+                _review_audit_block = (
+                    "('running', 'ready', 'blocked', 'review')"
+                    if _audit_override
+                    else "('running', 'ready', 'blocked')"
+                )
+                cur = conn.execute(
+                    f"""
+                    UPDATE tasks
+                       SET status       = '{target_status}',
+                           assignee     = ?,
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL
+                     WHERE id = ?
+                       AND status IN {_review_audit_block}
+                    """,
+                    (target_assignee, result, now, task_id),
+                )
+            else:
+                _plain_audit_block = (
+                    "('running', 'ready', 'blocked', 'review')"
+                    if _audit_override
+                    else "('running', 'ready', 'blocked')"
+                )
+                cur = conn.execute(
+                    f"""
+                    UPDATE tasks
+                       SET status       = '{target_status}',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL
+                     WHERE id = ?
+                       AND status IN {_plain_audit_block}
+                    """,
+                    (result, now, task_id),
+                )
         else:
-            cur = conn.execute(
-                """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
-                """,
-                (result, now, task_id, int(expected_run_id)),
-            )
+            if is_review_transition and target_assignee is not None:
+                _review_audit_block = (
+                    "('running', 'ready', 'blocked', 'review')"
+                    if _audit_override
+                    else "('running', 'ready', 'blocked')"
+                )
+                cur = conn.execute(
+                    f"""
+                    UPDATE tasks
+                       SET status       = '{target_status}',
+                           assignee     = ?,
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL
+                     WHERE id = ?
+                       AND status IN {_review_audit_block}
+                       AND current_run_id = ?
+                    """,
+                    (target_assignee, result, now, task_id, int(expected_run_id)),
+                )
+            else:
+                _plain_audit_block = (
+                    "('running', 'ready', 'blocked', 'review')"
+                    if _audit_override
+                    else "('running', 'ready', 'blocked')"
+                )
+                cur = conn.execute(
+                    f"""
+                    UPDATE tasks
+                       SET status       = '{target_status}',
+                           result       = ?,
+                           completed_at = ?,
+                           claim_lock   = NULL,
+                           claim_expires= NULL,
+                           worker_pid   = NULL
+                     WHERE id = ?
+                       AND status IN {_plain_audit_block}
+                       AND current_run_id = ?
+                    """,
+                    (result, now, task_id, int(expected_run_id)),
+                )
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
+            outcome="completed", status=target_status,
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
@@ -4140,11 +4674,116 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        _append_event(
-            conn, task_id, "completed",
-            completed_payload,
-            run_id=run_id,
-        )
+
+        # Emit audit events when review_outcome is set.
+        if review_outcome in ("pass", "fail"):
+            _auditor_identity = None
+            _claim_row = conn.execute(
+                "SELECT claim_lock FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if _claim_row and _claim_row["claim_lock"]:
+                try:
+                    _auditor_identity = _claim_row["claim_lock"].split(":")[1]
+                except (IndexError, ValueError):
+                    _auditor_identity = _claim_row["claim_lock"]
+            if review_outcome == "pass":
+                _append_event(
+                    conn, task_id, "audit_passed",
+                    {
+                        "outcome": "pass",
+                        "auditor": _auditor_identity,
+                        "timestamp": now,
+                        "summary": ev_summary or None,
+                    },
+                    run_id=run_id,
+                )
+                _now_cmt = int(time.time())
+                _audit_body = (
+                    f"Audit Passed by {_auditor_identity or 'anonymous'} "
+                    f"at {_now_cmt}."
+                )
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (task_id, "system", _audit_body, _now_cmt),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": "system", "len": len(_audit_body)},
+                    run_id=run_id,
+                )
+            else:  # fail
+                _append_event(
+                    conn, task_id, "audit_failed",
+                    {
+                        "outcome": "fail",
+                        "auditor": _auditor_identity,
+                        "timestamp": now,
+                        "summary": ev_summary or None,
+                    },
+                    run_id=run_id,
+                )
+                _findings = metadata.get("findings") if isinstance(metadata, dict) else None
+                _required_changes = metadata.get("required_changes") if isinstance(metadata, dict) else None
+                _source_title = (trow["title"] if trow and trow["title"] else task_id)
+                _source_assignee = (trow["assignee"] if trow else None) or _impl_assignee
+                _rework_id = _ensure_audit_rework_card_txn(
+                    conn,
+                    source_task_id=task_id,
+                    source_title=_source_title,
+                    assignee=_source_assignee,
+                    findings=str(_findings) if _findings else None,
+                    required_changes=str(_required_changes) if _required_changes else None,
+                    fallback_summary=ev_summary or result,
+                    now=now,
+                )
+                _fail_body = (
+                    f"Audit Failed by {_auditor_identity or 'anonymous'} at {now}. "
+                    f"REWORK card: {_rework_id}."
+                )
+                if _findings:
+                    _fail_body += f" Findings: {_findings}"
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (task_id, "system", _fail_body, now),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": "system", "len": len(_fail_body), "rework_task_id": _rework_id},
+                    run_id=run_id,
+                )
+        if is_review_transition:
+            _append_event(
+                conn, task_id, "implementation_completed_review_required",
+                {
+                    "from_assignee": trow["assignee"] if trow else None,
+                    "to_assignee": target_assignee,
+                    "summary": ev_summary or None,
+                },
+                run_id=run_id,
+            )
+            # Durable comment documenting the review hand-off.
+            # Inline the insert (we are already inside a write_txn).
+            _now_comment = int(time.time())
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, "system",
+                 f"Implementation completed, awaiting review by {target_assignee}.",
+                 _now_comment),
+            )
+            _append_event(
+                conn, task_id, "commented",
+                {"author": "system", "len": len(f"Implementation completed, awaiting review by {target_assignee}.")},
+                run_id=run_id,
+            )
+        else:
+            _append_event(
+                conn, task_id, "completed",
+                completed_payload,
+                run_id=run_id,
+            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -4172,19 +4811,119 @@ def complete_task(
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    # Skip for audit_fail: the task is deliberately blocked as a signal
+    # and recompute_ready would auto-promote it (sticky-block guard does not
+    # apply to audit-fail blocked tasks).  REWORK card dispatch is handled
+    # directly by the auditor's follow-up logic.
+    if review_outcome != "fail":
+        recompute_ready(conn)
+
+    # HARDENING (Agent Garden Stage 2): when a child implementation task
+    # completes with REVIEW_PASS, automatically promote its parent orchestration
+    # card to 'done'. The parent is purely orchestration (never spawned as a
+    # worker); it exists to gate the close-gate workflow. Its only job after
+    # all children are done is to signal the operator that the issue is ready
+    # for GitHub close. Auto-promoting the parent to done makes that signal
+    # visible on the board without requiring manual operator intervention.
+    # Rule: promote parent when all children are done, provided:
+    #   - review_outcome is "pass" (not "fail" and not absent)
+    #   - the task being completed is a child card (has parents)
+    #   - all sibling children of that parent are also done/archived
+    #   - the parent itself is still in 'todo' (not already done/archived)
+    _maybe_promote_parent_to_done(conn, task_id)
+
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
 
 
-# ---------------------------------------------------------------------------
-# Workspace / tmux cleanup
-# ---------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# Parent auto-done promotion (Agent Garden Stage 2 hardening)
+# --------------------------------------------------------------------------
+
+
+def _maybe_promote_parent_to_done(conn: sqlite3.Connection, completed_child_id: str) -> None:
+    """Promote parent orchestration card to done when all children are done.
+
+    Called from complete_task when a child implementation task completes with
+    REVIEW_PASS. The parent card is purely orchestration — it tracks the overall
+    issue progress and gates the GitHub close. When all children are done/archived,
+    the parent is eligible for auto-done so the operator can see at a glance that
+    the issue is ready to close.
+
+    Does nothing if:
+      - The completed task is not a child (no parents)
+      - Not all siblings are done/archived
+      - The parent is already done/archived
+      - The parent has a non-orchestration assignee (don't auto-done workers)
+    """
+    # Find the parent(s) of this child. In Agent Garden Stage 2, the parent
+    # is the triage/orchestration card created during decompose.
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        (completed_child_id,),
+    ).fetchall()
+    if not parent_rows:
+        return  # No parents — not a child card
+
+    for parent_row in parent_rows:
+        parent_id = parent_row["parent_id"]
+
+        # Check: is the parent still in 'todo'? Don't promote already-done tasks.
+        parent_info = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if parent_info is None:
+            continue
+        if parent_info["status"] not in ("todo", "ready"):
+            continue  # Already done/archived/review — leave it alone
+
+        # Check: all children of this parent must be done or archived.
+        child_rows = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?",
+            (parent_id,),
+        ).fetchall()
+        if not child_rows:
+            continue
+
+        all_done = all(
+            conn.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (child_row["child_id"],),
+            ).fetchone()["status"] in ("done", "archived")
+            for child_row in child_rows
+        )
+        if not all_done:
+            continue  # Some children still pending — wait
+
+        # Check: parent assignee should be an orchestrator profile, not a worker.
+        # We identify this by the Stage 2 pattern: parent's assignee is NOT
+        # deep-implementer or minimax-implementer (those are workers).
+        parent_assignee = parent_info["assignee"] or ""
+        if parent_assignee in ("deep-implementer", "minimax-implementer"):
+            continue  # Worker assignee — don't auto-done
+
+        # All conditions met: promote parent to done.
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (now, parent_id),
+        )
+        _append_event(
+            conn,
+            parent_id,
+            "auto_promoted_parent_done",
+            {
+                "triggered_by": completed_child_id,
+                "reason": "all_children_done_with_review_pass",
+            },
+        )
+
 
 def _is_managed_scratch_path(p: Path) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
-
     A managed root is exclusively a ``workspaces/`` directory — never the
     broader kanban home, a board root, or sibling subtrees like ``logs/`` or
     ``boards/<slug>/`` itself. Allowed roots:
@@ -4706,7 +5445,18 @@ def specify_triage_task(
             sets.append("title = ?")
             params.append(title.strip())
             changed_fields.append("title")
-        if body is not None and (body or "") != (existing["body"] or ""):
+        # PRESERVE EXISTING BODY — auto-decomposer must not overwrite
+        # fields the operator set on the parent card. mac_repo_path,
+        # ssh_target, and other metadata fields live in body and are
+        # intentionally left untouched. sqlite3.Row always supports
+        # key access (no .columns attribute exists).
+        existing_body = existing["body"] if existing["body"] is not None else ""
+        if body is None:
+            body = existing_body
+        elif not body.strip():
+            body = existing_body
+        # Only update body when a non-empty replacement was explicitly given.
+        if body != existing_body:
             sets.append("body = ?")
             params.append(body)
             changed_fields.append("body")
@@ -5249,6 +5999,12 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    forbidden_profile_rejected: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks skipped by hardcoded worker enforcement, as
+    ``(task_id, assignee, reason)`` triples. Each entry records which
+    worker profile was blocked and why — operator-actionable when a
+    task's assignee violates an intrinsic architectural invariant
+    (e.g. minimax-implementer assigned to implementation work)."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6286,13 +7042,22 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     now = int(time.time())
 
-    # 2. Completed run within guard window — proof of recent success.
+    # 2. Latest ended run is completed within guard window — proof of recent
+    # success. If a later crashed/failed/timed-out run exists, do NOT guard;
+    # that later failure is the current state and the task should be retryable.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
-    if conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
-        (task_id, cutoff),
-    ).fetchone():
+    latest = conn.execute(
+        "SELECT outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (
+        latest
+        and latest["outcome"] == "completed"
+        and latest["ended_at"] is not None
+        and int(latest["ended_at"]) >= cutoff
+    ):
         return "recent_success"
 
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
@@ -6328,13 +7093,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _is_spawnable_kanban_assignee(row["assignee"]):
             return True
     return False
 
@@ -6354,12 +7114,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _is_spawnable_kanban_assignee(row["assignee"]):
             return True
     return False
 
@@ -6484,20 +7240,13 @@ def dispatch_once(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
-    _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    # The dispatcher needs a concrete spawnable worker, so ``default`` and
+    # forbidden/non-existent profiles are rejected here instead of being
+    # written into the DB as nonspawnable debris.
+    _default_assignee = _canonical_assignee((default_assignee or "").strip() or None)
+    _default_assignee_resolved = bool(
+        _default_assignee and _is_spawnable_kanban_assignee(_default_assignee)
+    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -6520,6 +7269,15 @@ def dispatch_once(
                 if not dry_run:
                     try:
                         with write_txn(conn):
+                            # Best-effort race reduction: revalidate immediately
+                            # before the DB mutation in case the profile changed
+                            # after the per-tick check above.
+                            _validate_kanban_assignee(
+                                _default_assignee,
+                                allow_default=False,
+                                allow_control_plane=False,
+                                field="default_assignee",
+                            )
                             conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
@@ -6555,11 +7313,7 @@ def dispatch_once(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if not _is_spawnable_kanban_assignee(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -6567,6 +7321,19 @@ def dispatch_once(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Hardcoded worker profile enforcement: intrinsic invariants
+        # that are not config-based.  minimax-implementer is a review-only
+        # profile and must not be spawned for implementation work via
+        # the ready-task dispatch loop; review work goes through
+        # claim_review_task directly.
+        _enforce_reason = _check_hardcoded_worker_enforcement(
+            row_assignee, dispatch_type="implementation",
+        )
+        if _enforce_reason is not None:
+            result.forbidden_profile_rejected.append(
+                (row["id"], row_assignee, _enforce_reason)
+            )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
