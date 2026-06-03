@@ -1,0 +1,287 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes.local/schemas/kanban-project-adapter.schema.json",
+  "title": "Hermes Kanban Project Adapter",
+  "type": "object",
+  "required": [
+    "project_id",
+    "display_name",
+    "github_repo",
+    "board_name",
+    "default_branch",
+    "source_host",
+    "repo_path_by_host",
+    "execution_host_policy",
+    "workers",
+    "required_skills",
+    "required_prism_context",
+    "verification",
+    "close_gate"
+  ],
+  "properties": {
+    "project_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "github_repo": {
+      "type": "string",
+      "pattern": "^[^/]+/[^/]+$"
+    },
+    "board_name": {
+      "type": "string"
+    },
+    "default_branch": {
+      "type": "string"
+    },
+    "source_host": {
+      "enum": [
+        "mac",
+        "windows",
+        "pi",
+        "remote"
+      ]
+    },
+    "repo_path_by_host": {
+      "type": "object",
+      "properties": {
+        "mac": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pi": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windows": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Windows path such as C:\\Users\\name\\Code\\project"
+        },
+        "remote": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "host_targets": {
+      "type": "object",
+      "properties": {
+        "mac": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "windows": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "SSH or Computer Use target for Windows host"
+        },
+        "pi": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remote": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "windows": {
+      "type": "object",
+      "properties": {
+        "shell_type": {
+          "enum": [
+            "powershell",
+            "cmd",
+            "git-bash"
+          ]
+        },
+        "windows_only_warning": {
+          "type": "string"
+        },
+        "commands": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution_host_policy": {
+      "type": "object",
+      "required": [
+        "orchestrator_host",
+        "source_edit_host",
+        "parent_workspace",
+        "child_workspace",
+        "source_repo_access"
+      ],
+      "properties": {
+        "orchestrator_host": {
+          "enum": [
+            "pi",
+            "mac",
+            "windows",
+            "remote"
+          ]
+        },
+        "source_edit_host": {
+          "enum": [
+            "mac",
+            "windows",
+            "pi",
+            "remote"
+          ]
+        },
+        "parent_workspace": {
+          "enum": [
+            "pi_scratch",
+            "source_repo",
+            "remote_scratch"
+          ]
+        },
+        "child_workspace": {
+          "enum": [
+            "pi_scratch",
+            "source_repo",
+            "remote_scratch"
+          ]
+        },
+        "source_repo_access": {
+          "type": "string"
+        },
+        "host_routing_rules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "workers": {
+      "type": "object",
+      "required": [
+        "implementation",
+        "review"
+      ],
+      "properties": {
+        "implementation": {
+          "type": "string"
+        },
+        "review": {
+          "type": "string"
+        }
+      }
+    },
+    "required_skills": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_prism_context": {
+      "type": "string"
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "tests": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "build": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "browser": {
+          "type": "object"
+        },
+        "dev_server": {
+          "type": "object"
+        },
+        "ui_file_detection_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commands_by_host": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "close_gate": {
+      "type": "object",
+      "properties": {
+        "commit_push_before_close": {
+          "type": "boolean"
+        },
+        "review_evidence_required": {
+          "type": "boolean"
+        },
+        "remote_commit_verification_required": {
+          "type": "boolean"
+        },
+        "exceptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "artifact_paths": {
+      "type": "object"
+    },
+    "wiki_paths": {
+      "type": "object"
+    },
+    "known_failure_modes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "examples": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,21 @@
+{
+  "tests": [
+    "pytest supervisor/tests/test_config.py -q",
+    "pytest supervisor/tests/test_runtime_safety_hardening.py -q",
+    "pytest supervisor/tests/ -q"
+  ],
+  "browser": {
+    "required_if_ui": true,
+    "url": "http://localhost:4200/w/default/desktop"
+  },
+  "dev_server": {
+    "command": "WORKSPACE_ROOT=/Users/benny/Code/agent-garden PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH npm start"
+  },
+  "ui_file_detection_patterns": [
+    "\\.tsx$",
+    "\\.ts$",
+    "\\.jsx$",
+    "\\.css$",
+    "\\.scss$"
+  ]
+}

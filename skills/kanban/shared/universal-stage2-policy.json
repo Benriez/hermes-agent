@@ -1,0 +1,26 @@
+{
+  "policy_id": "universal-kanban-stage2-policy",
+  "version": "1.0",
+  "required_prism_context": "superhermes",
+  "mandatory_prism_full_when_adapter_requires": true,
+  "forbidden_assignees": [
+    "superhermes",
+    "local-implementer",
+    "local-reviewer"
+  ],
+  "hosts": {
+    "pi": "orchestration/artifacts/wiki/kanban",
+    "mac": "default source-edit host",
+    "windows": "windows-only source-edit host"
+  },
+  "close_gate": {
+    "commit_push_before_close": true,
+    "review_evidence_required": true,
+    "remote_commit_verification_required": true
+  },
+  "safety": {
+    "no_direct_sqlite_writes": true,
+    "no_issue_close_without_gate": true,
+    "no_source_host_paths_as_parent_workspace": true
+  }
+}

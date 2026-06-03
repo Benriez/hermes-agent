@@ -1,0 +1,19 @@
+{
+  "project_id": "agent-garden",
+  "issue_number": 48,
+  "parent_card": "t_38226981",
+  "child_card": "t_04990466",
+  "commit": "85ac8c77c8fdcc9ef4a2e51ba6d4e814c4c7db53",
+  "tests": [
+    "pytest supervisor/tests/test_config.py -q",
+    "pytest supervisor/tests/test_runtime_safety_hardening.py -q",
+    "pytest supervisor/tests/ -q"
+  ],
+  "lessons": [
+    "do not close GitHub issue before commit + push",
+    "parent card must not spawn on /Users/... Mac path",
+    "review evidence must be auditable",
+    "review assignee must be minimax-implementer",
+    "parent may auto-done only after child REVIEW_PASS / all child gates pass"
+  ]
+}

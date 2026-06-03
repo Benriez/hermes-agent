@@ -1,0 +1,80 @@
+{
+  "project_id": "agent-garden",
+  "display_name": "Agent Garden",
+  "github_repo": "Benriez/agent-garden",
+  "board_name": "agent-garden",
+  "default_branch": "bodi",
+  "source_host": "mac",
+  "repo_path_by_host": {
+    "mac": "/Users/benny/Code/agent-garden",
+    "pi": null,
+    "windows": null
+  },
+  "host_targets": {
+    "mac": "benny-mac",
+    "pi": "rpi4",
+    "windows": null
+  },
+  "execution_host_policy": {
+    "orchestrator_host": "pi",
+    "source_edit_host": "mac",
+    "parent_workspace": "pi_scratch",
+    "child_workspace": "pi_scratch",
+    "source_repo_access": "pi_to_mac_ssh_or_computer_use",
+    "host_routing_rules": [
+      "Do not use /Users/benny/Code/agent-garden as parent workspace",
+      "Implementation child uses Pi scratch workspace and operates on Mac repo via SSH/Computer Use",
+      "Mac repo path is adapter/card metadata only"
+    ]
+  },
+  "workers": {
+    "implementation": "deep-implementer",
+    "review": "minimax-implementer"
+  },
+  "required_skills": [
+    "prism-full"
+  ],
+  "required_prism_context": "superhermes",
+  "verification": {
+    "tests": [
+      "pytest supervisor/tests/test_config.py -q",
+      "pytest supervisor/tests/test_runtime_safety_hardening.py -q",
+      "pytest supervisor/tests/ -q"
+    ],
+    "browser": {
+      "required_if_ui": true,
+      "url": "http://localhost:4200/w/default/desktop"
+    },
+    "dev_server": {
+      "command": "WORKSPACE_ROOT=/Users/benny/Code/agent-garden PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH npm start"
+    },
+    "ui_file_detection_patterns": [
+      "\\.tsx$",
+      "\\.ts$",
+      "\\.jsx$",
+      "\\.css$",
+      "\\.scss$"
+    ]
+  },
+  "close_gate": {
+    "commit_push_before_close": true,
+    "review_evidence_required": true,
+    "remote_commit_verification_required": true
+  },
+  "artifact_paths": {
+    "root": "/home/flashback/.hermes/artifacts"
+  },
+  "wiki_paths": {
+    "project": "/home/flashback/.hermes/workspace/llm-wiki/wiki/projects/agent-garden"
+  },
+  "known_failure_modes": [
+    "close before commit + push",
+    "parent spawned on Mac repo path",
+    "missing auditable review evidence",
+    "review assigned away from minimax-implementer",
+    "parent auto-done before child REVIEW_PASS"
+  ],
+  "examples": [
+    "issue-48-success"
+  ]
+}

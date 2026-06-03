@@ -1,0 +1,17 @@
+{
+  "task": {
+    "id": "t_38226981",
+    "status": "done",
+    "skills": ["prism-full"],
+    "assignee": "minimax-implementer",
+    "workspace_path": "/Users/benny/Code/agent-garden",
+    "required_prism_context": "superhermes",
+    "metadata": {
+      "created_by": "nvidia-planner",
+      "source": "hermes kanban --json export"
+    }
+  },
+  "latest_summary": "PARENT_DONE: REVIEW_PASS recorded for issue #48",
+  "parents": [],
+  "children": []
+}

@@ -1,0 +1,15 @@
+{
+  "policy_id": "agent-garden-stage2-policy",
+  "inherits": "skills/kanban/shared/universal-stage2-policy.json",
+  "project_id": "agent-garden",
+  "mandatory_skills": [
+    "prism-full"
+  ],
+  "review_worker": "minimax-implementer",
+  "implementation_worker": "deep-implementer",
+  "close_gate": {
+    "commit_push_before_close": true,
+    "review_evidence_required": true,
+    "remote_commit_verification_required": true
+  }
+}
