@@ -61,3 +61,9 @@ Creates or validates safe Kanban card specifications from operator/project inten
 - Missing `prism-full`.
 - `superhermes` appears as assignee.
 
+
+## Parent Dependency Semantics
+- Hermes treats parent cards as dependencies for child execution.
+- After successful intake/decomposition, complete the orchestration parent (`done`) before child dispatch/promotion.
+- Parent `done` means orchestration setup is complete; it does **not** mean the GitHub issue is complete, reviewed, or close-gate approved.
+- Child execution/review/close-gate evidence remains required before any issue close action.

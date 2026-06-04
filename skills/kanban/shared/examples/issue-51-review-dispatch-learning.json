@@ -1,0 +1,42 @@
+{
+  "project_id": "agent-garden",
+  "issue_number": 51,
+  "parent_card": "t_3f26179c",
+  "child_card": "t_82e18e9d",
+  "implementation_commit": "0c50552edc43c513a8a0e220ff38504a12c2cdd9",
+  "review_result": "REVIEW_PASS",
+  "close_gate": "PASSED",
+  "github_issue_closed": false,
+  "runs": {
+    "86": {
+      "worker": "deep-implementer",
+      "result": "COMPLETED_INSUFFICIENT_EVIDENCE",
+      "missing": [
+        "commit_hash",
+        "push_confirmation"
+      ]
+    },
+    "87": {
+      "worker": "deep-implementer",
+      "result": "evidence_completion",
+      "commit": "0c50552edc43c513a8a0e220ff38504a12c2cdd9",
+      "pushed": "origin/bodi"
+    },
+    "88": {
+      "worker": "minimax-implementer",
+      "result": "crashed",
+      "cause": "Unknown skill(s): sdlc-review"
+    },
+    "89": {
+      "worker": "minimax-implementer",
+      "result": "REVIEW_PASS"
+    }
+  },
+  "lessons": [
+    "Parent orchestration cards are dependencies; complete parent after successful decomposition without treating GitHub issue as done.",
+    "Formal review requires status review; ready uses implementation dispatch.",
+    "minimax-implementer is review-only by default and must not be routed through implementation dispatch.",
+    "Dispatcher-required skills such as sdlc-review must be available or guarded before run start.",
+    "Direct SQLite ready-to-review transition was rescue-only and must not become normal workflow; use/request official CLI transition."
+  ]
+}

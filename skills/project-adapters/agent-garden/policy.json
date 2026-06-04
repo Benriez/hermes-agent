@@ -11,5 +11,20 @@
     "commit_push_before_close": true,
     "review_evidence_required": true,
     "remote_commit_verification_required": true
+  },
+  "dispatch_semantics": {
+    "implementation_status": "ready",
+    "formal_review_status": "review",
+    "review_worker": "minimax-implementer",
+    "review_worker_must_not_use_implementation_dispatch": true
+  },
+  "rescue_policy": {
+    "direct_sqlite_forbidden_in_normal_workflow": true,
+    "direct_sqlite_allowed_only_with_explicit_operator_rescue_and_artifact": true,
+    "official_cli_transition_required": true
+  },
+  "skill_availability": {
+    "review_dispatch_required_skills_must_be_available": true,
+    "sdlc_review_missing_incident": "issue-51-run-88"
   }
 }

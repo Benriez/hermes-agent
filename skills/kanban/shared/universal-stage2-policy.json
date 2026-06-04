@@ -22,5 +22,32 @@
     "no_direct_sqlite_writes": true,
     "no_issue_close_without_gate": true,
     "no_source_host_paths_as_parent_workspace": true
+  },
+  "parent_cards": {
+    "orchestration_only": true,
+    "complete_after_successful_decomposition": true,
+    "parent_done_means_orchestration_setup_complete_not_issue_complete": true,
+    "child_execution_depends_on_parent_done": true
+  },
+  "dispatch_semantics": {
+    "ready_status_path": "implementation_dispatch",
+    "review_status_path": "formal_review_claim_review_task",
+    "implementation_complete_requiring_review_must_transition_to": "review",
+    "do_not_set_review_assignee_card_to_ready": true
+  },
+  "review_worker": {
+    "minimax_implementer_review_only_by_default": true,
+    "do_not_route_minimax_through_implementation_dispatch": true,
+    "require_explicit_review_pass_or_fail": true
+  },
+  "sqlite_policy": {
+    "normal_workflow_direct_sqlite_forbidden": true,
+    "rescue_requires_explicit_authorization_and_artifact": true,
+    "normal_workflow_requires_official_cli_status_transitions": true
+  },
+  "skill_availability": {
+    "dispatcher_required_skills_checked_before_run_start": true,
+    "hardcoded_skill_requirements_must_be_guarded": true,
+    "known_incident": "issue-51-run-88-sdlc-review-missing"
   }
 }

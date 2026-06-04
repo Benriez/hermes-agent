@@ -66,3 +66,10 @@ Performs or validates review evidence for a completed implementation card. Revie
 - Review worker is implementation worker.
 - UI diff without browser evidence.
 
+
+## Review Status Dispatch Semantics
+- Cards requiring formal review must transition to status `review`; do not leave a review-assignee card in `ready`.
+- `ready` uses the implementation dispatch path. `review` uses the formal review path / `claim_review_task`.
+- `minimax-implementer` is review-only unless a project adapter explicitly allows otherwise; do not route it through implementation dispatch.
+- Review output must contain an explicit `REVIEW_PASS` or `REVIEW_FAIL` plus review artifact JSON, report TXT, and output log.
+- Before starting review, verify dispatcher-required skills are available. The Issue #51 run 88 crash (`Unknown skill(s): sdlc-review`) is a known failure mode when review dispatch hardcodes an unavailable skill.

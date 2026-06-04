@@ -68,3 +68,9 @@ Final read-only gate before any issue close action. This skill does not close is
 - Parent/child incomplete.
 - REVIEW_PASS missing.
 
+
+## Review-Pass and Issue-Close Separation
+- Close-gate can pass only after explicit `REVIEW_PASS` evidence and required artifact/report/log checks.
+- Close-gate passing does not automatically close a GitHub issue.
+- If the operator forbids issue close, report close-gate `PASSED` while leaving the GitHub issue open.
+- GitHub issue close is a separate operator-approved action after close-gate evidence is produced.

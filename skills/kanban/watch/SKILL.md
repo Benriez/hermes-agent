@@ -60,3 +60,9 @@ Read-only health watcher for active or recently completed Kanban workflows. It d
 - Review assigned to implementation worker.
 - Local/qwopus provider mention in logs.
 
+
+## Issue #51 Watch Warnings
+- Flag `status=ready` + `assignee=minimax-implementer` as a policy warning: ready uses implementation dispatch, while minimax review requires `review` status.
+- Flag review-run crashes containing `Unknown skill(s): sdlc-review` as dispatcher skill-availability gaps.
+- Flag direct SQLite status edits as rescue-only violations unless the operator explicitly authorized a rescue and an artifact records it.
+- Watchers must remain read-only: diagnose, write artifacts/reports, and recommend an official CLI transition or policy fix.

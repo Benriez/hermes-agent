@@ -72,9 +72,19 @@
     "parent spawned on Mac repo path",
     "missing auditable review evidence",
     "review assigned away from minimax-implementer",
-    "parent auto-done before child REVIEW_PASS"
+    "parent auto-done before child REVIEW_PASS",
+    "review card left ready for minimax-implementer instead of review status",
+    "review dispatch crash when sdlc-review skill is unavailable",
+    "direct SQLite transition used outside explicit rescue authorization"
   ],
   "examples": [
-    "issue-48-success"
-  ]
+    "issue-48-success",
+    "examples/issue-51-review-dispatch-learning.json"
+  ],
+  "dispatch_policy": {
+    "ready_status_path": "implementation_dispatch",
+    "review_status_path": "formal_review_claim_review_task",
+    "review_status_required_for_minimax": true,
+    "minimax_implementation_dispatch_allowed": false
+  }
 }

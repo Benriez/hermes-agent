@@ -17,5 +17,12 @@
     "\\.jsx$",
     "\\.css$",
     "\\.scss$"
+  ],
+  "workflow_policy_checks": [
+    "parent_orchestration_card_done_after_decomposition",
+    "formal_review_cards_use_review_status_not_ready",
+    "minimax_implementer_not_routed_through_implementation_dispatch",
+    "dispatcher_required_skills_available_before_review_start",
+    "no_direct_sqlite_except_authorized_rescue_artifact"
   ]
 }
