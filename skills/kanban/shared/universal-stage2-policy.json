@@ -114,5 +114,15 @@
     "plan_gate_must_use_worker_roles_not_concrete_workers": true,
     "plan_gate_adapter_specifics_must_be_in_adapter_context": true,
     "plan_gate_dispatch_decision_must_be_explicit": true
+  },
+  "partition_check": {
+    "partition_check_required_before_parallel_dispatch": true,
+    "partition_check_must_define_write_scope": true,
+    "partition_check_must_block_write_write_conflicts": true,
+    "partition_check_must_block_exclusive_lock_conflicts": true,
+    "partition_check_must_warn_on_write_read_overlap": true,
+    "partition_check_unknown_scope_requires_operator_approval": true,
+    "partition_check_adapter_specifics_must_be_in_adapter_context": true,
+    "partition_check_decision_must_be_explicit": true
   }
 }

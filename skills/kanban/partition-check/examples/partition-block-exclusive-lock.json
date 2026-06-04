@@ -1,0 +1,76 @@
+{
+  "partition_check": {
+    "candidate": {
+      "task_id": "candidate-1",
+      "adapter": "<adapter-id>",
+      "project": "<project-id>",
+      "repo_path": "<adapter-source-path>",
+      "worker_role": "implementation_worker",
+      "operation_type": "implementation",
+      "allowed_paths": [
+        "src/component-a/"
+      ],
+      "forbidden_paths": [
+        "src/component-b/",
+        "deploy/"
+      ],
+      "read_only_paths": [
+        "README.md"
+      ],
+      "write_paths": [
+        "src/lock-a/"
+      ],
+      "affected_systems": [
+        "<system-a>"
+      ],
+      "exclusive_locks": [
+        "service:<adapter-id>:restart"
+      ],
+      "shared_read_locks": [
+        "repo:<adapter-id>:read-docs"
+      ]
+    },
+    "active_work": [
+      {
+        "task_id": "active-1",
+        "adapter": "<adapter-id>",
+        "project": "<project-id>",
+        "repo_path": "<adapter-source-path>",
+        "worker_role": "implementation_worker",
+        "operation_type": "implementation",
+        "allowed_paths": [
+          "src/component-b/"
+        ],
+        "read_only_paths": [
+          "src/component-a/README.md"
+        ],
+        "write_paths": [
+          "src/lock-b/"
+        ],
+        "affected_systems": [
+          "<system-b>"
+        ],
+        "exclusive_locks": [
+          "service:<adapter-id>:restart"
+        ],
+        "shared_read_locks": [
+          "repo:<adapter-id>:read-docs"
+        ]
+      }
+    ],
+    "rules": {
+      "write_write_conflict_blocks": true,
+      "write_read_conflict_warns": true,
+      "exclusive_lock_conflict_blocks": true,
+      "same_repo_unspecified_scope_warns": true,
+      "unknown_scope_blocks_or_requires_operator": true,
+      "adapter_may_override": true
+    },
+    "decision": {
+      "concurrency_allowed": false,
+      "requires_serial_execution": true,
+      "requires_operator_approval": true,
+      "reason": "Both tasks claim the same exclusive service restart lock."
+    }
+  }
+}

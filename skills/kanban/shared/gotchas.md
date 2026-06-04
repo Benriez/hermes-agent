@@ -34,6 +34,18 @@
 
 ---
 
+### Parallel Workers Conflict Because Partition Check Was Missing
+
+**Symptom:** Two concurrent workers modify overlapping files, services, databases, evidence artifacts, or operational state and produce conflicting diffs or invalid verification evidence.
+
+**Cause:** Parallel dispatch happened without an explicit partition check proving disjoint write scope, lock ownership, affected systems, and conflict rules.
+
+**Rule:** Parallel implementation requires explicit disjoint write scope or operator-approved serialization. Unknown scope must not silently pass.
+
+**Canonical fix:** Run `skills/kanban/partition-check/scripts/check_partition.py <partition-check.json>` before concurrent dispatch. Serialize write/write or exclusive-lock conflicts.
+
+---
+
 ### Parent Done Means Orchestration Complete, Not Issue Complete
 
 **Symptom:** Parent card marked `done` but child evidence, review, and close-gate still required.

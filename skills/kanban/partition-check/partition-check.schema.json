@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Hermes Kanban Partition Check",
+  "type": "object",
+  "required": [
+    "partition_check"
+  ],
+  "properties": {
+    "partition_check": {
+      "type": "object",
+      "required": [
+        "candidate",
+        "active_work",
+        "rules",
+        "decision"
+      ],
+      "properties": {
+        "candidate": {
+          "$ref": "#/$defs/work_scope"
+        },
+        "active_work": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/work_scope"
+          }
+        },
+        "rules": {
+          "type": "object",
+          "required": [
+            "write_write_conflict_blocks",
+            "write_read_conflict_warns",
+            "exclusive_lock_conflict_blocks",
+            "same_repo_unspecified_scope_warns",
+            "unknown_scope_blocks_or_requires_operator",
+            "adapter_may_override"
+          ],
+          "properties": {
+            "write_write_conflict_blocks": {
+              "type": "boolean"
+            },
+            "write_read_conflict_warns": {
+              "type": "boolean"
+            },
+            "exclusive_lock_conflict_blocks": {
+              "type": "boolean"
+            },
+            "same_repo_unspecified_scope_warns": {
+              "type": "boolean"
+            },
+            "unknown_scope_blocks_or_requires_operator": {
+              "type": "boolean"
+            },
+            "adapter_may_override": {
+              "type": "boolean"
+            }
+          }
+        },
+        "decision": {
+          "type": "object",
+          "required": [
+            "concurrency_allowed",
+            "requires_serial_execution",
+            "requires_operator_approval",
+            "reason"
+          ],
+          "properties": {
+            "concurrency_allowed": {
+              "type": "boolean"
+            },
+            "requires_serial_execution": {
+              "type": "boolean"
+            },
+            "requires_operator_approval": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "work_scope": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "adapter",
+        "project",
+        "repo_path",
+        "worker_role",
+        "operation_type",
+        "allowed_paths",
+        "forbidden_paths",
+        "read_only_paths",
+        "write_paths",
+        "affected_systems",
+        "exclusive_locks",
+        "shared_read_locks"
+      ],
+      "properties": {
+        "task_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "adapter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "worker_role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "implementation",
+            "review",
+            "gitter",
+            "close_gate",
+            "documentation",
+            "audit",
+            null
+          ]
+        },
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "forbidden_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "read_only_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "write_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "affected_systems": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclusive_locks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shared_read_locks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
