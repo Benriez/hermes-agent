@@ -1,0 +1,19 @@
+{
+  "implementation_persistence": {
+    "task_id": "t_example",
+    "run_id": 100,
+    "implementation_completed": true,
+    "worker_claimed_changes": true,
+    "no_change_task": false,
+    "expected_changed_paths": [
+      "skills/kanban/README.md",
+      "skills/kanban/shared/index.md",
+      "skills/kanban/shared/universal-stage2-policy.json",
+      "skills/kanban/shared/gotchas.md"
+    ],
+    "actual_changed_paths": [],
+    "classification": "implementation_completed_but_no_persisted_changes",
+    "verdict": "BLOCK",
+    "reason": "Worker claimed documentation files were created, but target repository diff showed zero persisted changes in expected paths."
+  }
+}

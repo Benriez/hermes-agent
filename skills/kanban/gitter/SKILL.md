@@ -25,7 +25,7 @@ Validates that a completed task's git commit and push are safe, scoped, and don'
 ## When Not to Use
 - For pure read-only tasks that produced no repository changes.
 - For documentation-only tasks where operator explicitly chose no commit.
-- For tasks where no files were modified and the task body already records this.
+- For tasks where no files were modified and the task body already records explicit `no_change_task` / read-only classification.
 
 ## Required Gitter Fields
 A valid `gitter` gate must include:
@@ -51,6 +51,7 @@ A valid `gitter` gate must include:
 ## Fail/Block Criteria
 - `commit_required` is true but `files_to_commit` is empty or missing.
 - `commit_required` is true but `commit_message` is missing.
+- `commit_required` is true and provided `actual_changed_paths` is empty for expected changes, unless explicitly classified as a no-change/read-only task.
 - `force_push_allowed` is true without explicit operator approval.
 - Any safety flag (`github_issue_close_allowed`, `pr_allowed`, `merge_allowed`, `direct_sqlite_allowed`) is true without explicit operator approval.
 - `decision` is missing or does not state whether gitter is allowed.

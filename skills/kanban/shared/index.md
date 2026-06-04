@@ -62,7 +62,7 @@ Scripts perform read-only gate checks. JSON output with explicit pass/fail/missi
 | `card-spec/scripts/validate_parent_card.py` | Validate parent card metadata before dispatch | `kanban-card-spec` |
 | `plan-gate/scripts/check_plan_gate.py` | Validate plan, scope, forbidden actions, and verification strategy before implementation dispatch | `kanban-plan-gate` |
 | `partition-check/scripts/check_partition.py` | Validate write/read scope, locks, and concurrency safety before parallel dispatch | `kanban-partition-check` |
-| `watch/scripts/check_run_health.py` | Detect dead PID, stale heartbeat, ghost runs | `kanban-watch` |
+| `watch/scripts/check_run_health.py` | Detect dead PID, stale heartbeat, ghost runs, and missing persisted implementation changes | `kanban-watch` |
 | `review/scripts/check_review_evidence.py` | Verify review artifact/report/log exists | `kanban-review` |
 | `close-gate/scripts/check_close_gate.py` | Verify close-gate prerequisites | `kanban-close-gate` |
 | `gitter/scripts/check_gitter_scope.py` | Validate commit scope, safe staging, and push before close-gate | `kanban-gitter` |
@@ -129,10 +129,11 @@ python3 skills/kanban/plan-gate/scripts/check_plan_gate.py \
 python3 skills/kanban/partition-check/scripts/check_partition.py \
   <partition-check.json>
 
-# Check run health
+# Check run health and optional persistence evidence
 python3 skills/kanban/watch/scripts/check_run_health.py \
   --adapter skills/project-adapters/agent-garden/adapter.json \
-  --card-json <card.json>
+  --card-json <card.json> \
+  --persistence-json <implementation-persistence.json>
 
 # Verify review evidence
 python3 skills/kanban/review/scripts/check_review_evidence.py \

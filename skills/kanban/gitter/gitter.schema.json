@@ -3,35 +3,62 @@
   "title": "Hermes Kanban Gitter",
   "description": "Universal gitter scope validation gate for Hermes Kanban commit/push safety.",
   "type": "object",
-  "required": ["gitter"],
+  "required": [
+    "gitter"
+  ],
   "properties": {
     "gitter": {
       "type": "object",
-      "required": ["task", "git_context", "intended_scope", "commit_plan", "safety", "decision"],
+      "required": [
+        "task",
+        "git_context",
+        "intended_scope",
+        "commit_plan",
+        "safety",
+        "decision"
+      ],
       "properties": {
         "task": {
           "type": "object",
           "description": "Task identity and adapter context.",
-          "required": ["task_id", "adapter"],
+          "required": [
+            "task_id",
+            "adapter"
+          ],
           "properties": {
             "task_id": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Kanban task ID."
             },
             "adapter": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Project adapter identifier."
             },
             "project": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Project name."
             },
             "repo_path": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Repository path (adapter-owned, not hardcoded in universal skill)."
             },
             "issue": {
-              "type": ["integer", "null"],
+              "type": [
+                "integer",
+                "null"
+              ],
               "description": "GitHub issue number if applicable."
             }
           }
@@ -41,23 +68,38 @@
           "description": "Git context before and after the operation.",
           "properties": {
             "branch": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Local branch name."
             },
             "remote": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Remote name (e.g. origin). Adapter or task-specific."
             },
             "remote_branch": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Remote branch (e.g. refs/heads/main). Adapter or task-specific."
             },
             "head_before": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Commit hash before the commit. Null if no prior commit."
             },
             "head_after": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Commit hash after the commit. Null if commit not yet made."
             }
           }
@@ -69,13 +111,17 @@
             "files_to_commit": {
               "type": "array",
               "description": "Explicit list of files to commit. Must be non-empty when commit_required is true.",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "default": []
             },
             "files_to_exclude": {
               "type": "array",
               "description": "Files or patterns to exclude from staging even if in working tree.",
-              "items": { "type": "string" },
+              "items": {
+                "type": "string"
+              },
               "default": []
             },
             "allow_artifacts": {
@@ -92,6 +138,27 @@
               "type": "boolean",
               "description": "Whether source code files may be committed. Defaults to true.",
               "default": true
+            },
+            "expected_changed_paths": {
+              "type": "array",
+              "description": "Expected changed paths for persistence verification. Defaults to files_to_commit when omitted.",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "actual_changed_paths": {
+              "type": "array",
+              "description": "Actual changed paths observed in target repo diff/content evidence. If provided and empty while changes are expected, gitter blocks.",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "no_change_task": {
+              "type": "boolean",
+              "description": "Explicit no-change/read-only task classification. Required for empty diff success.",
+              "default": false
             }
           }
         },
@@ -110,18 +177,24 @@
               "default": true
             },
             "message": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Commit message. Required when commit_required is true."
             },
             "body": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Optional commit body or extended description."
             }
           }
         },
         "safety": {
           "type": "object",
-          "description": "Safety flag overrides — all default false.",
+          "description": "Safety flag overrides \u2014 all default false.",
           "properties": {
             "force_push_allowed": {
               "type": "boolean",
@@ -153,7 +226,10 @@
         "decision": {
           "type": "object",
           "description": "Explicit gitter gate decision.",
-          "required": ["gitter_allowed", "requires_operator_approval"],
+          "required": [
+            "gitter_allowed",
+            "requires_operator_approval"
+          ],
           "properties": {
             "gitter_allowed": {
               "type": "boolean",
@@ -164,7 +240,10 @@
               "description": "Whether operator approval is required before proceeding."
             },
             "reason": {
-              "type": ["string", "null"],
+              "type": [
+                "string",
+                "null"
+              ],
               "description": "Human-readable reason for the decision."
             }
           }

@@ -96,6 +96,9 @@ def main():
 
         commit_required = plan.get("commit_required", True)
         files_to_commit = scope.get("files_to_commit") or []
+        actual_changed_paths = scope.get("actual_changed_paths")
+        expected_changed_paths = scope.get("expected_changed_paths") or files_to_commit
+        no_change_task = bool(scope.get("no_change_task") or scope.get("read_only_task"))
         commit_message = plan.get("message")
         allow_artifacts = scope.get("allow_artifacts", False)
         allow_wiki = scope.get("allow_wiki_files", False)
@@ -115,11 +118,19 @@ def main():
                 errors.append(
                     "commit_required is true but commit_message is missing"
                 )
+            if actual_changed_paths is not None and expected_changed_paths and not actual_changed_paths and not no_change_task:
+                errors.append(
+                    "commit_required is true but actual_changed_paths is empty for expected changes"
+                )
         else:
             if not files_to_commit:
                 warnings.append(
                     "commit_required is false and files_to_commit is empty — "
-                    "this is acceptable for no-op tasks"
+                    "this is acceptable only for explicit no-op/read-only tasks"
+                )
+            if not no_change_task and not files_to_commit:
+                warnings.append(
+                    "empty commit scope requires explicit no_change_task/read_only_task classification"
                 )
 
         if force_push and not op_approved:

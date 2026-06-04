@@ -35,10 +35,11 @@ Final read-only gate before any issue close action. This skill does not close is
 2. Verify parent and all children are done.
 3. Verify no open rework cards.
 4. Verify review pass artifact exists.
-5. Verify tests/build/browser gates are pass or explicitly not applicable.
-6. Verify commit exists and remote branch contains commit.
-7. Run `scripts/check_close_gate.py`.
-8. Produce close-comment evidence; only operator-approved tooling may close.
+5. Verify implementation persistence evidence: expected writes have actual target repo changes, or task is explicitly no-change/read-only.
+6. Verify tests/build/browser gates are pass or explicitly not applicable.
+7. Verify commit exists and remote branch contains commit.
+8. Run `scripts/check_close_gate.py`.
+9. Produce close-comment evidence; only operator-approved tooling may close.
 
 ## Allowed Actions
 - Read git state, adapter, artifacts, Kanban summaries.
@@ -58,6 +59,7 @@ Final read-only gate before any issue close action. This skill does not close is
 - Parent card summary JSON.
 - Children summary JSON.
 - Review evidence (see accepted sources below).
+- Implementation persistence evidence (`implementation_success_with_persisted_changes`, `no_change_task_success`, or failure classification).
 - Commit hash and remote/branch.
 - Test/browser evidence paths or status.
 
@@ -103,6 +105,12 @@ Close-gate must verify commit exists on the **actual remote/branch** used in the
 - Parent/child incomplete.
 - REVIEW_PASS missing and no acceptable alternative evidence.
 - Remote verification fails (commit not on stated remote/branch).
+- `implementation_completed_but_no_persisted_changes`: implementation finished but expected target repo changes are absent.
+
+## Implementation Persistence Classifications
+- `implementation_success_with_persisted_changes` — expected write paths have actual target repo diff/content evidence.
+- `no_change_task_success` — task explicitly declared no-change/read-only and has no expected writes.
+- `implementation_completed_but_no_persisted_changes` — close-gate failure; worker summary is not sufficient evidence.
 
 ## Warnings That Are Not Failures
 

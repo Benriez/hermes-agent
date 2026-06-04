@@ -46,6 +46,20 @@
 
 ---
 
+### Implementation Completed But No Persisted Target Repo Changes
+
+**Symptom:** Worker reports completion and claims files were created or edited, but `git diff` / target repo evidence shows zero changes in expected allowed paths.
+
+**Cause:** Implementation ran in a scratch or inaccessible workspace, changes were cleaned, or the worker summary described intended work rather than durable target repo state.
+
+**Rule:** Implementation completion is not enough. Worker summary is not sufficient evidence. If expected write paths exist, watch/review/gitter/close-gate must verify actual target repo diff/content evidence. Zero diff is success only for an explicit `no_change_task` / read-only classification.
+
+**Canonical fix:** Run watch persistence evidence with `expected_changed_paths` and `actual_changed_paths`. Classify missing changes as `implementation_completed_but_no_persisted_changes` and block review/gitter/close-gate until durable evidence exists.
+
+**Reference:** `skills/kanban/watch/scripts/check_run_health.py --persistence-json <evidence.json>`
+
+---
+
 ### Parent Done Means Orchestration Complete, Not Issue Complete
 
 **Symptom:** Parent card marked `done` but child evidence, review, and close-gate still required.
@@ -285,3 +299,4 @@ Only non-critical environmental warnings exist. Evaluate warnings for severity; 
 | t_50dd31da run 90 | Auto-dispatched parent, `Unknown skill(s): kanban-card-spec, kanban-watch` | `--initial-status blocked` + `prism-full` only in runtime skills |
 | Run #96 | Ghost run, worker dead, DB still running | Watch + reclaim pattern |
 | t_02f1e58a review | No separate review JSON/TXT | Accept run metadata + agent log as evidence |
+| t_20096ee4 pilot | Implementation completed but zero target repo diff | Persistence evidence gate blocks review/gitter/close-gate |

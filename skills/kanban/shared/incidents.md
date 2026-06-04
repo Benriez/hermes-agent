@@ -39,6 +39,14 @@
 - **Canonical fix:** Watch task detects dead PID + stale heartbeat; `kanban reclaim` to reclaim card; dispatcher auto-reclaimed at next tick
 - **Reference:** `watch/scripts/check_run_health.py` ghost run detection
 
+### t_20096ee4 — Production Pilot Persistence Failure
+- **Date:** 2026-06-04
+- **Title:** Implementation completed and review passed, but expected target repo changes were absent
+- **Root cause:** Worker summary claimed files were created, but `git diff` showed zero changes in expected allowed paths. Scratch or inaccessible workspace state was treated as success without durable target repo evidence.
+- **Canonical fix:** Watch persistence gate classifies this as `implementation_completed_but_no_persisted_changes`; review/gitter/close-gate must require actual target repo diff/content evidence or explicit no-change classification.
+- **Artifact:** `~/.hermes/artifacts/kanban-production-v0-1-first-pilot.artifact.json`
+- **Reference:** `watch/scripts/check_run_health.py --persistence-json <evidence.json>`
+
 ### Issue #48 — Success Workflow Pilot
 - **Date:** 2026-06-03
 - **Title:** First complete Agent Garden Stage 2 issue
@@ -65,3 +73,4 @@
 | Ghost run | DB `running`, worker dead | Watch + reclaim pattern |
 | Missing review evidence | No separate JSON/TXT files | Accept run metadata + agent log |
 | Scratch workspace gone | Artifacts inaccessible | Use global `~/.hermes/artifacts/` |
+| Completed but no persisted changes | Worker claims success, target repo diff empty | Watch persistence evidence: expected_changed_paths vs actual_changed_paths |

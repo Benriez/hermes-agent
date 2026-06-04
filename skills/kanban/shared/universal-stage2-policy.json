@@ -1,6 +1,6 @@
 {
   "policy_id": "universal-kanban-stage2-policy",
-  "version": "1.1",
+  "version": "1.2",
   "required_prism_context": "superhermes",
   "mandatory_prism_full_when_adapter_requires": true,
   "forbidden_assignees": [
@@ -27,7 +27,10 @@
     "scratch_workspace_cleanup_is_warning_not_failure": true,
     "github_issue_number_null_close_not_applicable": true,
     "remote_target_must_be_task_specific": true,
-    "close_gate_pass_with_warnings_allowed": true
+    "close_gate_pass_with_warnings_allowed": true,
+    "implementation_persistence_evidence_required_when_changes_expected": true,
+    "implementation_completed_but_no_persisted_changes_blocks_close_gate": true,
+    "close_gate_accepts_no_change_task_success_only_when_explicit": true
   },
   "safety": {
     "no_direct_sqlite_writes": true,
@@ -73,7 +76,10 @@
     "review_workers_must_use_formal_review_status": true,
     "implementation_dispatch_must_not_select_adapter_declared_review_worker": true,
     "require_explicit_review_pass_or_fail": true,
-    "concrete_review_worker_names_belong_to_project_adapter": true
+    "concrete_review_worker_names_belong_to_project_adapter": true,
+    "review_must_verify_actual_file_content_or_diff": true,
+    "worker_summary_alone_must_not_pass_review": true,
+    "review_must_fail_expected_writes_with_zero_persisted_changes": true
   },
   "sqlite_policy": {
     "normal_workflow_direct_sqlite_forbidden": true,
@@ -136,6 +142,21 @@
     "gitter_remote_target_is_task_or_adapter_specific": true,
     "gitter_artifact_or_wiki_commit_requires_explicit_allowance": true,
     "gitter_decision_must_be_explicit": true,
-    "gitter_uses_explicit_staging_only": true
+    "gitter_uses_explicit_staging_only": true,
+    "gitter_blocks_expected_changes_with_empty_actual_diff": true,
+    "gitter_allows_empty_diff_only_for_explicit_no_commit_or_read_only_task": true
+  },
+  "implementation_persistence": {
+    "implementation_completion_requires_durable_evidence": true,
+    "worker_summary_is_not_sufficient_evidence": true,
+    "expected_write_paths_require_actual_target_repo_changes": true,
+    "zero_diff_in_allowed_paths_blocks_when_writes_expected": true,
+    "explicit_no_change_task_classification_required_for_zero_diff_success": true,
+    "implementation_completed_but_no_persisted_changes_is_failure": true,
+    "accepted_success_classifications": [
+      "implementation_success_with_persisted_changes",
+      "no_change_task_success"
+    ],
+    "failure_classification": "implementation_completed_but_no_persisted_changes"
   }
 }

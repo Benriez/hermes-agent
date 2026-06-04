@@ -27,10 +27,51 @@ def done(x):
     if isinstance(inner, dict) and inner.get('status') in ('done', 'archived'):
         return True
     return False
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
+
+def check_implementation_evidence(evidence):
+    if isinstance(evidence, dict) and isinstance(evidence.get('implementation_persistence'), dict):
+        ev = evidence['implementation_persistence']
+    else:
+        ev = evidence if isinstance(evidence, dict) else {}
+    expected = _as_list(ev.get('expected_changed_paths') or ev.get('expected_write_paths'))
+    actual = _as_list(ev.get('actual_changed_paths') or ev.get('actual_write_paths'))
+    no_change_task = bool(ev.get('no_change_task') or ev.get('read_only_task'))
+    worker_claimed_changes = bool(ev.get('worker_claimed_changes'))
+    classification = ev.get('classification')
+    expected_changes = bool(expected) or worker_claimed_changes
+    missing = []
+    warnings = []
+    if classification == 'implementation_completed_but_no_persisted_changes':
+        missing.append('implementation_completed_but_no_persisted_changes')
+    if expected_changes and not actual and not no_change_task:
+        missing.append('expected implementation changes have no persisted target repo evidence')
+    if worker_claimed_changes and not actual:
+        warnings.append('worker summary is not sufficient evidence without actual_changed_paths')
+    if no_change_task and not actual:
+        classification = classification or 'no_change_task_success'
+    elif actual:
+        classification = classification or 'implementation_success_with_persisted_changes'
+    else:
+        classification = classification or 'persistence_evidence_incomplete'
+    return missing, warnings, {
+        'classification': classification,
+        'expected_changed_paths': expected,
+        'actual_changed_paths': actual,
+        'no_change_task': no_change_task,
+        'worker_claimed_changes': worker_claimed_changes,
+    }
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--adapter',required=True); p.add_argument('--issue-number'); p.add_argument('--parent-json',required=True); p.add_argument('--children-json',required=True)
-    p.add_argument('--review-artifact',required=True); p.add_argument('--commit'); p.add_argument('--repo-path'); p.add_argument('--branch'); p.add_argument('--expected-files-json'); p.add_argument('--wiki-path'); p.add_argument('--artifact-path'); p.add_argument('--output')
+    p.add_argument('--review-artifact',required=True); p.add_argument('--commit'); p.add_argument('--repo-path'); p.add_argument('--branch'); p.add_argument('--expected-files-json'); p.add_argument('--implementation-evidence'); p.add_argument('--wiki-path'); p.add_argument('--artifact-path'); p.add_argument('--output')
     a=p.parse_args(); adapter=read_json(a.adapter); parent=read_json(a.parent_json); children=read_json(a.children_json); missing=[]; warnings=[]
     if a.issue_number is None: warnings.append('issue existence not checked: no issue number provided')
     if not done(parent): missing.append('parent not done/archived')
@@ -53,7 +94,14 @@ def main():
     else: missing.append('commit hash missing')
     for label,path in [('wiki',a.wiki_path),('artifact',a.artifact_path)]:
         if path and not Path(path).exists(): missing.append(f'{label} path missing: {path}')
+    implementation_persistence = None
+    if a.implementation_evidence:
+        ev_missing, ev_warnings, implementation_persistence = check_implementation_evidence(read_json(a.implementation_evidence))
+        missing.extend(ev_missing)
+        warnings.extend(ev_warnings)
     result={'passed':not missing,'missing_gates':missing,'warnings':warnings,'issue_number':a.issue_number,'commit':a.commit}
+    if implementation_persistence is not None:
+        result['implementation_persistence'] = implementation_persistence
     out=json.dumps(result,indent=2); print(out)
     if a.output: Path(a.output).write_text(out+'\n')
     sys.exit(0 if result['passed'] else 1)
