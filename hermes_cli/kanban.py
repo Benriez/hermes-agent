@@ -342,12 +342,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
     p_create.add_argument("--initial-status",
-                          choices=sorted(kb.VALID_INITIAL_STATUSES),
-                          default="running",
-                          help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
-    p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+                          default="blocked",
+                          help="Initial card status. Default: 'blocked' — "
+                               "cards start non-dispatchable to allow "
+                               "body/metadata/card-spec/plan-gate/partition-check "
+                               "to be added before dispatch. Use 'running' only "
+                               "when you explicitly want immediate dispatch.")
 
     # --- swarm ---
     p_swarm = sub.add_parser(

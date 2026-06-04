@@ -2574,7 +2574,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
-    initial_status: str = "running",
+    initial_status: str = "blocked",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
@@ -2709,13 +2709,30 @@ def create_task(
                 _validate_kanban_assignee(assignee, allow_default=True)
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
+                # triage for a specifier, or explicitly requests immediate
+                # dispatch via initial_status="running".
+                #
+                # Safe default: new cards start in 'blocked' so body,
+                # card-spec, plan-gate, partition-check, and metadata can be
+                # added before any dispatch occurs. This prevents the
+                # auto-dispatch-on-creation race where a card is spawned before
+                # workflow metadata is written (#t_50dd31da, #t_21be546a).
+                #
+                # Explicit --initial-status running is the operator's signal
+                # that all pre-dispatch validation is complete and the card
+                # should go directly to 'running' for immediate dispatch.
                 if initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "running":
+                    # Explicit immediate-dispatch signal from operator.
+                    # Skip parent-based todo/ready resolution — the operator
+                    # confirms all pre-dispatch gates (card-spec, plan-gate,
+                    # partition-check, metadata) are complete.
+                    task_status = "running"
                 elif triage:
                     task_status = "triage"
                 else:
@@ -7198,10 +7215,28 @@ def dispatch_once(
             ).fetchone()[0]
         )
 
+    # Dispatch guard: skip newly-created tasks that just transitioned to
+    # 'ready' before their body/metadata/card-spec/plan-gate/partition-check
+    # could be written. Without this, a card created without --initial-status
+    # blocked can be spawned in the same dispatcher tick that promoted it
+    # (#t_50dd31da, #t_21be546a). Tasks with a workspace_path already set
+    # have been through a previous dispatch attempt and may proceed.
+    # The 60-second window is an empirical safety margin; the root fix is
+    # the new default initial_status="blocked", but this guard provides
+    # additional protection against the dispatch-on-creation race.
+    _now = int(time.time())
+    _recent_cutoff = _now - 60
+
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        """SELECT t.id, t.assignee
+           FROM tasks t
+           LEFT JOIN task_events e ON e.task_id = t.id AND e.kind = 'created'
+           WHERE t.status = 'ready'
+             AND t.claim_lock IS NULL
+             AND (t.workspace_path IS NOT NULL
+                  OR e.created_at < ?)
+           ORDER BY t.priority DESC, t.created_at ASC""",
+        (_recent_cutoff,),
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
