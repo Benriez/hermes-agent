@@ -12,7 +12,7 @@
 - **Root cause:** Review dispatch hardcoded `sdlc-review` as required skill without checking availability
 - **Canonical fix:** `_resolve_task_skill_in_home()` guard in `_default_spawn`; silently skip missing optional skills
 - **Notable:** Review evidence lived in `kanban run` metadata (`review_passed: true`), no separate JSON/TXT files produced
-- **Close-gate:** CLOSE_GATE_PASS_WITH_WARNINGS (scratch workspace cleaned, GitHub issue null, benriez/bodi vs origin/bodi)
+- **Close-gate:** CLOSE_GATE_PASS_WITH_WARNINGS (scratch workspace cleaned, GitHub issue null, `<user>/<branch>` vs assumed origin/<branch> — Agent Garden incident: benriez/bodi)
 - **Example:** `../shared/examples/sdlc-review-availability-guard-close-gate-learning.json`
 - **Artifacts:** `~/.hermes/artifacts/agent-garden-sdlc-review-*`
 
@@ -43,14 +43,14 @@
 - **Date:** 2026-06-03
 - **Title:** First complete Agent Garden Stage 2 issue
 - **Root cause:** Workflow gaps identified: GitHub close before commit, wrong workspace, wrong review worker
-- **Canonical fix:** Close gate requires commit + push before close; Pi-local scratch workspace; minimax-implementer for review
+- **Canonical fix:** Close gate requires commit + push before close; Pi-local scratch workspace; review worker (Agent Garden: `minimax-implementer`) for review
 - **Example:** `../shared/examples/issue-48-success.json`
 
-### Remote Target Ambiguity (benriez/bodi vs origin/bodi)
+### Remote Target Ambiguity (Agent Garden: benriez/bodi vs origin/bodi)
 - **Date:** 2026-06-04
 - **Title:** Close-gate failed by assuming wrong remote
-- **Root cause:** Task body referenced `origin/bodi` but push was to `benriez/bodi` (user fork)
-- **Canonical fix:** Always verify actual remote/branch with `git ls-remote <remote> refs/heads/<branch>`; `origin` = upstream NousResearch, `benriez` = user fork
+- **Root cause:** Task body referenced `origin/<branch>` but push was to `<user>/<branch>` (user fork)
+- **Canonical fix:** Always verify actual remote/branch with `git ls-remote <remote> refs/heads/<branch>`; `origin` = upstream NousResearch, `<user>` = user fork
 - **Reference:** `../gotchas.md` — "Remote and Branch Naming" gotcha
 
 ---
@@ -61,7 +61,7 @@
 |---|---|---|
 | Intake parent auto-dispatch | Card spawned immediately | `--initial-status blocked` |
 | Skill resolver crash | `Unknown skill(s): kanban-card-spec` | Only runtime skills in `card.skills` |
-| Wrong dispatch path | `minimax` in `ready` status | Use `review` status for formal review |
+| Wrong dispatch path | review worker in `ready` status (Agent Garden: `minimax-implementer`) | Use `review` status for formal review |
 | Ghost run | DB `running`, worker dead | Watch + reclaim pattern |
 | Missing review evidence | No separate JSON/TXT files | Accept run metadata + agent log |
 | Scratch workspace gone | Artifacts inaccessible | Use global `~/.hermes/artifacts/` |

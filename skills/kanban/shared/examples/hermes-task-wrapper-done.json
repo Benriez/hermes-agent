@@ -4,7 +4,7 @@
     "status": "done",
     "skills": ["prism-full"],
     "assignee": "minimax-implementer",
-    "workspace_path": "/Users/benny/Code/agent-garden",
+    "workspace_path": "<adapter-source-path>",
     "required_prism_context": "superhermes",
     "metadata": {
       "created_by": "nvidia-planner",

@@ -112,7 +112,7 @@ The following are **warnings** that do not prevent a CLOSE_GATE_PASS:
 2. No separate review JSON/TXT (use run metadata + agent log)
 3. GitHub issue number is null (internal follow-up card; GitHub close not applicable)
 4. Unrelated dirty files in working tree (verify only intended files were committed)
-5. Remote is benriez/bodi instead of assumed origin/bodi (verify against actual target)
+5. Remote is `<user>/<branch>` not assumed origin/<branch> (verify against actual target; Agent Garden incident: benriez/bodi vs origin/bodi)
 
 Close-gate classification:
 - `CLOSE_GATE_PASS` — all core gates pass, no warnings

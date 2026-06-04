@@ -1,7 +1,7 @@
 {
   "example_type": "sdlc_review_availability_guard_close_gate_learning",
   "version": "1.0",
-  "description": "Incident learning from t_02f1e58a close-gate. Documents accepted evidence patterns, warnings, and remote verification rules discovered during the sdlc-review availability guard implementation.",
+  "description": "Agent Garden incident learning from t_02f1e58a close-gate. Documents accepted evidence patterns, warnings, and remote verification rules discovered during the sdlc-review availability guard implementation. Concrete values (card IDs, run numbers, commit hash, remote/branch) are Agent Garden-specific incident evidence. Universal lessons are in warnings and evidence patterns.",
   "parent_card": "t_50dd31da",
   "child_card": "t_02f1e58a",
   "implementation_run": 97,
@@ -22,7 +22,7 @@
       "mitigation": "internal follow-up card; github close not applicable"
     },
     {
-      "warning": "remote is benriez/bodi not origin/bodi",
+      "warning": "remote is <user>/<branch> not assumed origin/<branch> (Agent Garden: benriez/bodi vs origin/bodi)",
       "classification": "non-critical",
       "mitigation": "verified commit exists on actual remote target; bodi is user fork branch"
     },
@@ -39,7 +39,7 @@
     },
     {
       "decision": "require remote verification against actual remote target",
-      "source": "benriez/bodi vs assumed origin/bodi"
+      "source": "<user>/<branch> vs assumed origin/<branch> (Agent Garden incident: benriez/bodi)"
     },
     {
       "decision": "do not close github issue when issue_number is null",

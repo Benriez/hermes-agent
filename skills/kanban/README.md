@@ -69,7 +69,7 @@ Script contract: Python 3, JSON output, exit `0`=pass / `1`=fail / `2`=usage err
 ## Key Policy Reminders
 
 - **Intake parents:** Always use `--initial-status blocked`. Only `prism-full` in runtime skills.
-- **`ready` vs `review`:** `ready` = implementation dispatch. `review` = formal review path. `minimax-implementer` must use `review`.
+- **`ready` vs `review`:** `ready` = implementation dispatch. `review` = formal review path. Review worker (Agent Garden adapter: `minimax-implementer`) must use `review`.
 - **Parent done:** Means orchestration/decomposition complete only. Child review + close-gate still required.
 - **Direct SQLite:** Rescue-only with operator authorization + artifact evidence.
 - **Dispatcher skill guards:** Optional skills must be availability-checked before spawn.

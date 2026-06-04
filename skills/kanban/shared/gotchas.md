@@ -10,11 +10,13 @@
 
 ### `ready` Routes Through Implementation; `review` Routes Through Formal Review
 
-**Symptom:** `minimax-implementer` assigned to a card in `ready` status is routed through implementation dispatch and blocked.
+**Symptom (Agent Garden adapter example):** `minimax-implementer` assigned to a card in `ready` status is routed through implementation dispatch and blocked.
 
 **Cause:** The dispatcher treats `ready` as an implementation signal, not a review signal.
 
 **Rule:** Formal review requires card status `review`, not `ready`. Use official CLI to transition. Direct SQLite writes for this transition were rescue-only.
+
+**Universal principle:** `ready` = implementation dispatch. `review` = formal review path. A review worker (Agent Garden: `minimax-implementer`; other adapters may differ) must use `review` status, not `ready`.
 
 **Canonical fix:** Use `hermes kanban --board <board> move-to-review <card>` when available, or `edit --status review`.
 
@@ -94,7 +96,7 @@ if not _resolve_task_skill_in_home(env.get("HERMES_HOME"), sk):
 
 **Symptom:** Close-gate or watch task finds no `review-report.json`/`review-report.txt` files.
 
-**Cause:** `minimax-implementer` review agents may record `REVIEW_PASS` in Kanban run metadata (`review_passed: true` + structured summary) without producing separate artifact files.
+**Cause:** Agent Garden's `minimax-implementer` review agent may record `REVIEW_PASS` in Kanban run metadata (`review_passed: true` + structured summary) without producing separate artifact files.
 
 **Rule:** Accept `kanban run --json` metadata + agent log + watch artifact as sufficient evidence when `review_passed: true` and summary confirms review. Missing separate review files is a warning, not automatic failure.
 
@@ -191,13 +193,13 @@ Only non-critical environmental warnings exist. Evaluate warnings for severity; 
 
 ## Evidence Cross-References
 
-### Source Workflow
+### Source Workflow (Agent Garden incident evidence)
 
-- **Parent card:** t_50dd31da (Stage 1 Intake)
+- **Parent card:** t_50dd31da (Stage 1 Intake, Agent Garden board)
 - **Child card:** t_02f1e58a (Follow-up — sdlc-review availability guard)
-- **Implementation run:** #97 (deep-implementer)
-- **Review run:** #99 (minimax-implementer, REVIEW_PASS)
-- **Commit:** `30ed778ec` on `benriez/bodi`
+- **Implementation run:** #97 (Agent Garden: deep-implementer)
+- **Review run:** #99 (Agent Garden: minimax-implementer, REVIEW_PASS)
+- **Commit:** `30ed778ec` on `<remote>/<branch>` (Agent Garden incident: benriez/bodi)
 - **Close-gate:** CLOSE_GATE_PASS_WITH_WARNINGS
 
 ### Related Files

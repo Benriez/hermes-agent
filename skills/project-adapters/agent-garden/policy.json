@@ -1,6 +1,19 @@
 {
   "policy_id": "agent-garden-stage2-policy",
   "version": "1.1",
+  "policy_inheritance": {
+    "universal_policy": "skills/kanban/shared/universal-stage2-policy.json",
+    "inherits_close_gate": true,
+    "inherits_parent_card_semantics": true,
+    "inherits_forbidden_assignees": true,
+    "inherits_runtime_skill_rules": true,
+    "adapter_specializations": {
+      "close_gate": "adapter may add project-specific warnings (e.g. remote target verification for Agent Garden remotes)",
+      "workers": "concrete worker names (deep-implementer, minimax-implementer) belong to adapter policy",
+      "review_worker": "Agent Garden: minimax-implementer",
+      "implementation_worker": "Agent Garden: deep-implementer"
+    }
+  },
   "inherits": "skills/kanban/shared/universal-stage2-policy.json",
   "project_id": "agent-garden",
   "mandatory_skills": [
