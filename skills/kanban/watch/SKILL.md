@@ -30,11 +30,35 @@ Read-only health watcher for active or recently completed Kanban workflows. It d
 1. Load adapter and expected workers/hosts.
 2. Inspect card status, assignee, workspace, pid, heartbeat, and logs if provided.
 3. Detect dead pid, stale heartbeat, wrong workspace, wrong assignee, forbidden provider mentions.
-4. Run `scripts/check_run_health.py`.
-5. Hand off to `kanban-recovery` if health fails.
+4. Detect if review has completed with explicit REVIEW_PASS in run metadata (review may not produce separate artifact files — check `kanban runs --json` for `review_passed: true`).
+5. If scratch workspace is inaccessible but global artifacts and run metadata confirm workflow completion, record as warning rather than failure.
+6. Run `scripts/check_run_health.py`.
+7. Hand off to `kanban-recovery` if health fails.
 
-## Allowed Actions
-- Read local files and process state.
+## Scratch Workspace Lifecycle Warning
+
+Scratch workspaces (`workspaces/<card-id>/`) may be cleaned by the workspace lifecycle after task completion. Implementation artifacts stored only in scratch workspace become inaccessible.
+
+**Rule:** Do not treat inaccessible scratch workspace as a health failure if global evidence exists:
+- Commit hash on remote
+- Global artifacts (`~/.hermes/artifacts/`)
+- Kanban run metadata with explicit `review_passed: true`
+- Agent log confirming review completion
+
+**Watch task should record `scratch_workspace_cleaned: true` as a warning, not a health failure.**
+
+## Review Evidence Detection
+
+Watch tasks may encounter review runs where:
+- Separate `review-report.json` / `review-report.txt` are absent
+- `kanban runs --json` shows `review_passed: true` in metadata
+- Agent log shows explicit `REVIEW_PASS` or `REVIEW_FAIL`
+
+**Rule:** Accept run metadata + agent log as sufficient review evidence. Record `review_evidence_source: "run_metadata + agent_log"` in watch artifact.
+
+## Required Artifacts
+- Run-health JSON when monitoring evidence is needed.
+- Watch artifact JSON capturing all detected states and warnings.
 - Write health JSON only when output path is provided.
 
 ## Forbidden Actions

@@ -1,0 +1,58 @@
+{
+  "example_type": "sdlc_review_availability_guard_close_gate_learning",
+  "version": "1.0",
+  "description": "Agent Garden specific: t_02f1e58a close-gate learning. Records that benriez/bodi is the correct remote for this user's fork, that review evidence lived in run metadata, and that internal follow-up cards have no GitHub issue.",
+  "project": "agent-garden",
+  "board": "agent-garden",
+  "parent_card": "t_50dd31da",
+  "child_card": "t_02f1e58a",
+  "implementation_run": 97,
+  "review_run": 99,
+  "commit_hash": "30ed778ec46b806079e8cebf1be11503c77ae0b6",
+  "remote": "benriez",
+  "remote_branch": "bodi",
+  "upstream_origin_note": "origin = NousResearch/hermes-agent (upstream); benriez = Benriez/hermes-agent (user fork). bodi branch was created on benriez, not origin.",
+  "close_gate_status": "CLOSE_GATE_PASS_WITH_WARNINGS",
+  "warnings": [
+    {
+      "warning": "scratch workspace was cleaned by lifecycle",
+      "classification": "non-critical",
+      "mitigation": "global artifacts + run metadata + agent log + remote commit"
+    },
+    {
+      "warning": "github issue number is null",
+      "classification": "non-critical",
+      "mitigation": "internal follow-up card; github close not applicable"
+    },
+    {
+      "warning": "remote is benriez/bodi not origin/bodi",
+      "classification": "non-critical",
+      "mitigation": "verified against actual remote target; bodi is user fork branch"
+    }
+  ],
+  "agent_garden_specific": {
+    "hermes_repo": "/home/flashback/.hermes/hermes-agent",
+    "skill_availability_guard": {
+      "incident": "issue-51-run-88 sdlc-review missing",
+      "symptom": "Unknown skill(s): sdlc-review",
+      "fix_location": "hermes_cli/kanban_db.py _default_spawn lines 7944-7950",
+      "fix_pattern": "_resolve_task_skill_in_home guard",
+      "affected_skills": ["sdlc-review"],
+      "guard_pattern": "if not _resolve_task_skill_in_home(env.get('HERMES_HOME'), sk): continue"
+    },
+    "review_evidence_source": "kanban run #99 metadata (review_passed: true) + agent log + watch artifact",
+    "review_passed": true,
+    "separate_review_artifacts_produced": false,
+    "gitter_note": "implementer produced evidence; gitter created commit and push to benriez/bodi"
+  },
+  "canonical_decisions": [
+    "accept run metadata + agent log as review evidence when REVIEW_PASS is explicit",
+    "verify against actual remote target, not assumed origin/bodi",
+    "do not close github issue when issue_number is null",
+    "scratch workspace cleanup is warning not failure when global evidence exists",
+    "close_gate_pass_with_warnings is valid classification"
+  ],
+  "gotchas_reference": "skills/kanban/shared/gotchas.md",
+  "policy_reference": "skills/project-adapters/agent-garden/policy.json",
+  "universal_examples_reference": "skills/kanban/shared/examples/sdlc-review-availability-guard-close-gate-learning.json"
+}

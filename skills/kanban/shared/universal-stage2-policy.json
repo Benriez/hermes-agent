@@ -16,7 +16,18 @@
   "close_gate": {
     "commit_push_before_close": true,
     "review_evidence_required": true,
-    "remote_commit_verification_required": true
+    "remote_commit_verification_required": true,
+    "accepted_review_evidence_sources": [
+      "review_artifact_json",
+      "review_report_txt",
+      "kanban_run_metadata_review_passed",
+      "review_agent_log",
+      "review_watch_artifact"
+    ],
+    "scratch_workspace_cleanup_is_warning_not_failure": true,
+    "github_issue_number_null_close_not_applicable": true,
+    "remote_target_must_be_task_specific": true,
+    "close_gate_pass_with_warnings_allowed": true
   },
   "safety": {
     "no_direct_sqlite_writes": true,
@@ -67,9 +78,13 @@
   "skill_availability": {
     "dispatcher_required_skills_checked_before_run_start": true,
     "hardcoded_skill_requirements_must_be_guarded": true,
+    "optional_review_skills_must_be_availability_guarded": true,
     "known_incidents": [
       "issue-51-run-88-sdlc-review-missing",
       "issue-t_50dd31da-run-90-kanban-card-spec-kanban-watch-unknown"
     ]
+  },
+  "role_separation": {
+    "gitter_role_explicit_for_commit_push": true
   }
 }

@@ -1,0 +1,75 @@
+{
+  "example_type": "sdlc_review_availability_guard_close_gate_learning",
+  "version": "1.0",
+  "description": "Incident learning from t_02f1e58a close-gate. Documents accepted evidence patterns, warnings, and remote verification rules discovered during the sdlc-review availability guard implementation.",
+  "parent_card": "t_50dd31da",
+  "child_card": "t_02f1e58a",
+  "implementation_run": 97,
+  "review_run": 99,
+  "commit_hash": "30ed778ec46b806079e8cebf1be11503c77ae0b6",
+  "remote": "benriez",
+  "remote_branch": "bodi",
+  "close_gate_status": "CLOSE_GATE_PASS_WITH_WARNINGS",
+  "warnings": [
+    {
+      "warning": "scratch workspace was cleaned by lifecycle",
+      "classification": "non-critical",
+      "mitigation": "used global artifacts + run metadata + agent log + remote commit verification"
+    },
+    {
+      "warning": "github issue number is null",
+      "classification": "non-critical",
+      "mitigation": "internal follow-up card; github close not applicable"
+    },
+    {
+      "warning": "remote is benriez/bodi not origin/bodi",
+      "classification": "non-critical",
+      "mitigation": "verified commit exists on actual remote target; bodi is user fork branch"
+    },
+    {
+      "warning": "unrelated dirty files in working tree",
+      "classification": "non-critical",
+      "mitigation": "verified only intended files were staged and committed"
+    }
+  ],
+  "canonical_decisions": [
+    {
+      "decision": "accept run metadata + agent log as review evidence when REVIEW_PASS is explicit",
+      "source": "kanban run #99 metadata with review_passed: true"
+    },
+    {
+      "decision": "require remote verification against actual remote target",
+      "source": "benriez/bodi vs assumed origin/bodi"
+    },
+    {
+      "decision": "do not close github issue when issue_number is null",
+      "source": "internal follow-up card t_02f1e58a"
+    },
+    {
+      "decision": "scratch workspace cleanup is warning not failure when global evidence exists",
+      "source": "global artifacts + run metadata + remote commit"
+    },
+    {
+      "decision": "close_gate_pass_with_warnings is valid classification",
+      "source": "all core gates passed with non-critical warnings"
+    }
+  ],
+  "skill_availability_guard": {
+    "incident": "issue-51-run-88 sdlc-review missing",
+    "symptom": "Unknown skill(s): sdlc-review",
+    "fix_location": "hermes_cli/kanban_db.py _default_spawn lines 7944-7950",
+    "fix_pattern": "_resolve_task_skill_in_home guard before CLI --skills injection",
+    "affected_skills": ["sdlc-review"],
+    "guard_pattern": "if not _resolve_task_skill_in_home(env.get('HERMES_HOME'), sk): continue"
+  },
+  "review_evidence_patterns": {
+    "preferred": ["review_artifact_json", "review_report_txt", "output_log"],
+    "acceptable_alternative": ["kanban_run_metadata_review_passed", "review_agent_log", "review_watch_artifact"],
+    "actual_used": "kanban run #99 metadata (review_passed: true) + agent log + watch artifact"
+  },
+  "gitter_role": {
+    "gitter_explicit_for_commit_push": true,
+    "note": "implementer produced evidence; gitter created commit and push"
+  },
+  "gotchas_reference": "skills/kanban/shared/gotchas.md"
+}
