@@ -9,6 +9,7 @@
 | Skill | Category | Trigger |
 |---|---|---|
 | `kanban-card-spec` | Workflow schema/business process | Create, validate, decompose, or repair parent/child cards |
+| `kanban-plan-gate` | Planning/dispatch gate | Validate plan, scope, forbidden actions, and verification strategy before implementation dispatch |
 | `kanban-watch` | Runbook/product verification | Watch runs, detect ghost/stale runs, check evidence readiness |
 | `kanban-review` | Code quality/review | Validate REVIEW_PASS/FAIL evidence, prevent dispatch mistakes |
 | `kanban-close-gate` | Release/CI gate | Decide close eligibility: pass, pass-with-warnings, fail |
@@ -45,6 +46,7 @@ skills/kanban/<skill>/
 
 **Workflow/operator skills** (body metadata only, NOT runtime skills):
 - `kanban-card-spec`
+- `kanban-plan-gate`
 - `kanban-watch`
 - `kanban-review`
 - `kanban-close-gate`
@@ -55,11 +57,23 @@ skills/kanban/<skill>/
 
 Adapters live under `skills/project-adapters/<project_id>/` and are loaded by deterministic scripts via JSON paths.
 
+## Inner-Loop Workflow Sequence
+
+1. `kanban-card-spec` — validate card structure and workflow/runtime skill separation.
+2. `kanban-plan-gate` — validate plan, success criteria, non-goals, forbidden actions, scope, and verification strategy.
+3. Implementation dispatch — adapter-declared implementation worker.
+4. `kanban-watch` — monitor run health and evidence readiness.
+5. `kanban-review` — validate review evidence and REVIEW_PASS/FAIL.
+6. Gitter/committer role — commit/push when requested and gated (future/pending skill role, not an existing skill here).
+7. `kanban-close-gate` — decide close eligibility.
+8. Record learning — update gotchas/incidents/examples when requested.
+
 ## Deterministic Scripts
 
 | Script | Skill | Purpose |
 |---|---|---|
 | `card-spec/scripts/validate_parent_card.py` | `kanban-card-spec` | Validate card metadata before dispatch |
+| `plan-gate/scripts/check_plan_gate.py` | `kanban-plan-gate` | Validate implementation plan, scope, forbidden actions, and verification strategy |
 | `watch/scripts/check_run_health.py` | `kanban-watch` | Detect dead PID, stale heartbeat, ghost runs |
 | `review/scripts/check_review_evidence.py` | `kanban-review` | Verify review artifact/report/log exists |
 | `close-gate/scripts/check_close_gate.py` | `kanban-close-gate` | Verify close-gate prerequisites |
@@ -69,6 +83,7 @@ Script contract: Python 3, JSON output, exit `0`=pass / `1`=fail / `2`=usage err
 ## Key Policy Reminders
 
 - **Intake parents:** Always use `--initial-status blocked`. Only `prism-full` in runtime skills.
+- **Plan gate:** Before ambiguous or risky implementation dispatch, require a plan with success criteria, non-goals, forbidden actions, bounded scope, and verification strategy.
 - **`ready` vs `review`:** `ready` = implementation dispatch. `review` = formal review path. Review worker (Agent Garden adapter: `minimax-implementer`) must use `review`.
 - **Parent done:** Means orchestration/decomposition complete only. Child review + close-gate still required.
 - **Direct SQLite:** Rescue-only with operator authorization + artifact evidence.

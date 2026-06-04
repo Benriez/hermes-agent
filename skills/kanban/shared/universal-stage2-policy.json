@@ -105,5 +105,14 @@
     "universal_validator_validates_only_forbidden_assignees": true,
     "adapter_declares_implementation_and_review_workers": true,
     "validate_parent_card_script_is_adapter_driven": true
+  },
+  "plan_gate": {
+    "plan_gate_required_before_implementation_dispatch": true,
+    "plan_gate_must_define_verification_strategy": true,
+    "plan_gate_must_define_forbidden_actions": true,
+    "plan_gate_must_define_success_criteria": true,
+    "plan_gate_must_use_worker_roles_not_concrete_workers": true,
+    "plan_gate_adapter_specifics_must_be_in_adapter_context": true,
+    "plan_gate_dispatch_decision_must_be_explicit": true
   }
 }

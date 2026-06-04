@@ -22,6 +22,18 @@
 
 ---
 
+### Wrong Problem Solved Correctly Because Plan Gate Was Missing
+
+**Symptom:** Implementation worker reports success, but the changed system, files, or verification target do not match the operator's real intent.
+
+**Cause:** The card was dispatchable before it had an explicit plan gate: problem statement, success criteria, non-goals, forbidden actions, bounded scope, and verification strategy were not reviewable before implementation.
+
+**Rule:** Do not dispatch ambiguous or risky implementation work without a plan gate. Universal plan gates use worker roles and adapter context; concrete worker names remain adapter policy.
+
+**Canonical fix:** Create or validate `plan_gate` first and run `skills/kanban/plan-gate/scripts/check_plan_gate.py <plan-gate.json>` before implementation dispatch.
+
+---
+
 ### Parent Done Means Orchestration Complete, Not Issue Complete
 
 **Symptom:** Parent card marked `done` but child evidence, review, and close-gate still required.

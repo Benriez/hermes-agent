@@ -1,0 +1,75 @@
+{
+  "plan_gate": {
+    "problem_statement": "A Kanban implementation task needs a bounded plan before dispatch so the worker changes the intended system, not a plausible adjacent problem.",
+    "operator_intent": "Validate that the implementation should update only the reusable operator skill documentation and deterministic checker assets.",
+    "success_criteria": [
+      "Plan gate object is complete and passes deterministic validation.",
+      "Implementation scope is limited to allowed skill files.",
+      "Verification evidence is known before dispatch."
+    ],
+    "non_goals": [
+      "Do not dispatch workers",
+      "Do not modify runtime source",
+      "Do not change adapter-specific policy from the universal plan"
+    ],
+    "forbidden_actions": [
+      "Do not direct-write SQLite",
+      "Do not close GitHub issues",
+      "Do not use concrete worker names in universal policy"
+    ],
+    "scope": {
+      "allowed_paths": [
+        "skills/kanban/<skill>/",
+        "skills/kanban/shared/"
+      ],
+      "forbidden_paths": [
+        "agent/",
+        "gateway/",
+        "hermes_cli/",
+        "<adapter-source-path>"
+      ],
+      "affected_systems": [
+        "Hermes Kanban reusable skill layer"
+      ]
+    },
+    "adapter_context": {
+      "adapter": null,
+      "project": null,
+      "repo_path": "<adapter-source-path>",
+      "issue": null
+    },
+    "execution_plan": [
+      "Read existing reusable skill conventions",
+      "Create or update only universal skill artifacts",
+      "Run deterministic validation before dispatch"
+    ],
+    "verification_strategy": {
+      "commands": [
+        "python3 -m json.tool <plan-gate.json>",
+        "python3 skills/kanban/plan-gate/scripts/check_plan_gate.py <plan-gate.json>"
+      ],
+      "manual_checks": [
+        "Confirm universal wording uses roles, not concrete workers"
+      ],
+      "evidence_expected": [
+        "checker JSON status PASS",
+        "boundary grep shows no concrete adapter worker names"
+      ]
+    },
+    "risk_assessment": {
+      "risk_level": "low",
+      "known_risks": [
+        "Over-constraining trivial tasks"
+      ],
+      "rollback_or_recovery": [
+        "Revise plan_gate before dispatch"
+      ]
+    },
+    "dispatch_decision": {
+      "ready_for_implementation": true,
+      "required_worker_role": "implementation_worker",
+      "requires_operator_approval": true,
+      "reason": "Plan is bounded, verifiable, and role-based."
+    }
+  }
+}

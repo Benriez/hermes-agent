@@ -9,6 +9,7 @@
 | When you need to... | Use this skill | Key SKILL.md |
 |---|---|---|
 | Create or validate a parent/child card | `kanban-card-spec` | `skills/kanban/card-spec/SKILL.md` |
+| Validate a plan before implementation dispatch | `kanban-plan-gate` | `skills/kanban/plan-gate/SKILL.md` |
 | Watch a running card, detect ghost runs | `kanban-watch` | `skills/kanban/watch/SKILL.md` |
 | Validate review evidence, audit REVIEW_PASS | `kanban-review` | `skills/kanban/review/SKILL.md` |
 | Run close-gate, classify pass/fail/warnings | `kanban-close-gate` | `skills/kanban/close-gate/SKILL.md` |
@@ -57,6 +58,7 @@ Scripts perform read-only gate checks. JSON output with explicit pass/fail/missi
 | Script | Purpose | Skill |
 |---|---|---|
 | `card-spec/scripts/validate_parent_card.py` | Validate parent card metadata before dispatch | `kanban-card-spec` |
+| `plan-gate/scripts/check_plan_gate.py` | Validate plan, scope, forbidden actions, and verification strategy before implementation dispatch | `kanban-plan-gate` |
 | `watch/scripts/check_run_health.py` | Detect dead PID, stale heartbeat, ghost runs | `kanban-watch` |
 | `review/scripts/check_review_evidence.py` | Verify review artifact/report/log exists | `kanban-review` |
 | `close-gate/scripts/check_close_gate.py` | Verify close-gate prerequisites | `kanban-close-gate` |
@@ -73,6 +75,7 @@ Script contract:
 ### Skill Categories
 
 - **`kanban-card-spec`** — Workflow schema/business process. Validates card structure, worker eligibility, intake rules.
+- **`kanban-plan-gate`** — Planning/dispatch gate. Validates problem statement, scope, forbidden actions, success criteria, and verification strategy before implementation dispatch.
 - **`kanban-watch`** — Runbook/product verification. Detects ghost/stale runs, checks evidence readiness.
 - **`kanban-review`** — Code quality/review. Validates REVIEW_PASS/FAIL evidence, prevents dispatch mistakes.
 - **`kanban-close-gate`** — Release/CI gate. Classifies close eligibility: pass, pass-with-warnings, fail.
@@ -84,6 +87,7 @@ Script contract:
 
 **Workflow/operator skills** (in body metadata only, NOT runtime skills):
 - `kanban-card-spec`
+- `kanban-plan-gate`
 - `kanban-watch`
 - `kanban-review`
 - `kanban-close-gate`
@@ -108,6 +112,10 @@ Script contract:
 python3 skills/kanban/card-spec/scripts/validate_parent_card.py \
   --adapter skills/project-adapters/agent-garden/adapter.json \
   --card-json <parent-card.json>
+
+# Validate plan gate before implementation dispatch
+python3 skills/kanban/plan-gate/scripts/check_plan_gate.py \
+  <plan-gate.json>
 
 # Check run health
 python3 skills/kanban/watch/scripts/check_run_health.py \
