@@ -66,3 +66,53 @@ Read-only health watcher for active or recently completed Kanban workflows. It d
 - Flag review-run crashes containing `Unknown skill(s): sdlc-review` as dispatcher skill-availability gaps.
 - Flag direct SQLite status edits as rescue-only violations unless the operator explicitly authorized a rescue and an artifact records it.
 - Watchers must remain read-only: diagnose, write artifacts/reports, and recommend an official CLI transition or policy fix.
+
+## Issue t_50dd31da Watch Warnings — Intake Parent Auto-Dispatch
+
+The following patterns are **policy violations** for Stage 1 intake parent cards:
+
+1. **status=ready on intake parent card**:
+   - Intake parent cards must be created with `--initial-status blocked`.
+   - A `ready` intake parent means the dispatcher will attempt to auto-assign
+     and spawn a worker. This must not happen for orchestration-only parents.
+   - Recommended action: block immediately, investigate how `ready` was created,
+     update intake procedure to always use `--initial-status blocked`.
+
+2. **spawnable assignee on intake parent card**:
+   - Intake parent cards must not be assigned to spawnable workers.
+   - `deep-implementer` (or any spawnable profile) as assignee on an intake
+     parent is a warning sign. If the parent is `ready`, the dispatcher will
+     spawn the worker immediately.
+   - Recommended action: reclaim, block, verify no child cards exist.
+
+3. **card `skills` field includes `kanban-card-spec` or `kanban-watch`**:
+   - These are operator/workflow skills, not worker runtime skills.
+   - The card `skills` field is passed to workers as `--skills` at startup.
+   - Worker skill resolver searches `~/.hermes/skills/` and
+     `~/.hermes/custom-skills/` only. `kanban-card-spec` and `kanban-watch`
+     live under `hermes-agent/skills/kanban/` which is NOT in the search path.
+   - Result: worker crashes at startup with
+     `Unknown skill(s): kanban-card-spec, kanban-watch`.
+   - Recommended action: move these skill names from card `skills` field to
+     body metadata (`workflow_skill:`, `operator_skills_used:`).
+
+4. **Card body should contain workflow metadata**:
+   - Correct metadata fields in card body:
+     ```
+     workflow_skill: kanban-card-spec
+     operator_skills_used: [kanban-card-spec, kanban-watch]
+     required_skills: [prism-full]
+     ```
+   - Correct card `--skills` argument:
+     ```
+     --skills prism-full
+     ```
+   - Wrong (causes worker crash): `--skills kanban-card-spec,kanban-watch,prism-full`
+
+5. **Known incident**: t_50dd31da run 90 auto-dispatched despite being an
+   intake parent. Root causes:
+   - Card created with default `ready` status (no `--initial-status blocked`).
+   - `deep-implementer` auto-assigned by dispatcher via `default_assignee`.
+   - `kanban-card-spec` and `kanban-watch` in card `skills` field caused
+     worker startup crash `Unknown skill(s): kanban-card-spec, kanban-watch`.
+   - Mitigation: manual reclaim + block.

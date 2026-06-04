@@ -75,7 +75,9 @@
     "parent auto-done before child REVIEW_PASS",
     "review card left ready for minimax-implementer instead of review status",
     "review dispatch crash when sdlc-review skill is unavailable",
-    "direct SQLite transition used outside explicit rescue authorization"
+    "direct SQLite transition used outside explicit rescue authorization",
+    "intake parent created ready and auto-dispatched with unknown worker skills kanban-card-spec and kanban-watch",
+    "kanban workflow skills placed in card skills field instead of body metadata"
   ],
   "examples": [
     "issue-48-success",

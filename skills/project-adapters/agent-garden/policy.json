@@ -1,5 +1,6 @@
 {
   "policy_id": "agent-garden-stage2-policy",
+  "version": "1.1",
   "inherits": "skills/kanban/shared/universal-stage2-policy.json",
   "project_id": "agent-garden",
   "mandatory_skills": [
@@ -18,6 +19,23 @@
     "review_worker": "minimax-implementer",
     "review_worker_must_not_use_implementation_dispatch": true
   },
+  "intake_parent_policy": {
+    "initial_status_must_be_blocked": true,
+    "must_not_auto_dispatch": true,
+    "runtime_worker_skills_only": true,
+    "card_skills_field_means_worker_runtime_skills": true,
+    "allowed_runtime_worker_skills": ["prism-full"],
+    "forbidden_runtime_worker_skills": [
+      "kanban-card-spec",
+      "kanban-watch",
+      "kanban-review",
+      "kanban-close-gate"
+    ],
+    "workflow_skill_in_body": "kanban-card-spec",
+    "operator_skills_used_in_body": ["kanban-card-spec", "kanban-watch"],
+    "required_worker_skills_in_body": ["prism-full"],
+    "canonical_create_command": "hermes kanban --board agent-garden create --title 'Stage 1 Intake — <issue>' --initial-status blocked --skills prism-full --body '<body with workflow metadata>'"
+  },
   "rescue_policy": {
     "direct_sqlite_forbidden_in_normal_workflow": true,
     "direct_sqlite_allowed_only_with_explicit_operator_rescue_and_artifact": true,
@@ -25,6 +43,9 @@
   },
   "skill_availability": {
     "review_dispatch_required_skills_must_be_available": true,
-    "sdlc_review_missing_incident": "issue-51-run-88"
+    "known_incidents": [
+      "issue-51-run-88-sdlc-review-missing",
+      "issue-t_50dd31da-run-90-kanban-card-spec-kanban-watch-unknown"
+    ]
   }
 }

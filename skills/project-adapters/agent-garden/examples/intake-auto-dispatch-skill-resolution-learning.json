@@ -1,0 +1,68 @@
+{
+  "incident_id": "t_50dd31da-run-90",
+  "project_id": "agent-garden",
+  "parent_card": "t_50dd31da",
+  "board": "agent-garden",
+  "followup_issue": "Review dispatch should guard sdlc-review availability",
+  "runs": {
+    "90": {
+      "worker": "deep-implementer",
+      "result": "crashed",
+      "cause": "Unknown skill(s): kanban-card-spec, kanban-watch",
+      "status_on_create": "ready",
+      "assignee_on_create": null,
+      "auto_dispatched": true,
+      "reclaimed": true,
+      "reclaim_reason": "Operator safety stop: intake parent must not dispatch workers; created card auto-dispatched via default assignee"
+    },
+    "91": {
+      "worker": "deep-implementer",
+      "result": "blocked",
+      "status": "blocked",
+      "reason": "Blocked after safety stop: intake parent only; no implementation/worker dispatch allowed until explicit decomposition approval."
+    }
+  },
+  "root_causes": [
+    {
+      "code": "DEFAULT_READY",
+      "description": "hermes kanban create defaults to status=ready when --initial-status is not specified"
+    },
+    {
+      "code": "DEFAULT_ASSIGNEE_SPAWNABLE",
+      "description": "Dispatcher auto-assigned deep-implementer via kanban.default_assignee and immediately spawned"
+    },
+    {
+      "code": "POLICY_MISSING_INTAKE_HOLD",
+      "description": "No policy enforced intake parent cards to be created with --initial-status blocked or non-spawnable assignee"
+    },
+    {
+      "code": "BUNDLED_SKILLS_NOT_IN_WORKER_SEARCH_PATH",
+      "description": "kanban-card-spec and kanban-watch live at hermes-agent/skills/kanban/ which is not in worker skill search path (~/.hermes/skills/ or ~/.hermes/custom-skills/)"
+    },
+    {
+      "code": "WORKFLOW_SKILL_MISUSED_AS_REQUIRED_WORKER_SKILL",
+      "description": "kanban-card-spec and kanban-watch are operator/workflow skills placed in card skills field which propagates to --skills CLI arg for workers"
+    }
+  ],
+  "canonical_create_pattern": {
+    "command": "hermes kanban --board agent-garden create --title 'Stage 1 Intake — <title>' --initial-status blocked --skills prism-full --body '<body metadata>'",
+    "card_skills_runtime": ["prism-full"],
+    "body_workflow_skill": "kanban-card-spec",
+    "body_operator_skills_used": ["kanban-card-spec", "kanban-watch"],
+    "body_required_skills": ["prism-full"],
+    "forbidden_runtime_skills": ["kanban-card-spec", "kanban-watch", "kanban-review", "kanban-close-gate"]
+  },
+  "agent_garden_specific_notes": {
+    "source_host": "mac",
+    "repo_path_metadata_only": "/Users/benny/Code/agent-garden",
+    "parent_workspace": "pi_scratch",
+    "implementation_worker": "deep-implementer",
+    "review_worker": "minimax-implementer",
+    "required_context": "superhermes"
+  },
+  "policy_updates": {
+    "adapter_json": "skills/project-adapters/agent-garden/adapter.json",
+    "policy_json": "skills/project-adapters/agent-garden/policy.json v1.1",
+    "verification_json": "skills/project-adapters/agent-garden/verification.json"
+  }
+}

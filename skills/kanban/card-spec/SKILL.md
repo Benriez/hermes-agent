@@ -56,10 +56,52 @@ Creates or validates safe Kanban card specifications from operator/project inten
 - Valid parent: `kanban-decompose` or implementation-specific card creation.
 - Invalid parent: `kanban-recovery` or operator correction.
 
+## Intake Parent Card Creation Rules
+
+**Critical — intake parent cards must follow these rules:**
+
+1. **Initial status**: Always use `--initial-status blocked`.
+   Intake parent cards must **never** be created with default `ready` status.
+   ```bash
+   hermes kanban --board agent-garden create \
+     --title "Stage 1 Intake — <issue>" \
+     --initial-status blocked \
+     --skills prism-full \
+     ...
+   ```
+
+2. **Runtime skills field**: The `--skills` argument and card `skills` field
+   are interpreted as **worker runtime skills** passed to the CLI as `--skills`.
+   Only worker-loadable runtime skills belong here (e.g. `prism-full`).
+
+3. **Workflow/operator skills belong in body metadata only**:
+   - `workflow_skill: kanban-card-spec`
+   - `operator_skills_used: [kanban-card-spec, kanban-watch]`
+   - `required_skills: [prism-full]` (dispatcher routing hint)
+
+4. **Forbidden in runtime skills for intake parents**:
+   - `kanban-card-spec`
+   - `kanban-watch`
+   - `kanban-review`
+   - `kanban-close-gate`
+
+   These are operator/workflow skills. They exist at
+   `skills/kanban/<skill>/SKILL.md` but are **not** in the worker skill
+   search path (`~/.hermes/skills/` or `~/.hermes/custom-skills/`).
+   Placing them in the card `skills` field causes worker startup failure:
+   `Unknown skill(s): kanban-card-spec, kanban-watch`.
+
+5. **Assignee**: Do not assign intake parent cards to spawnable workers
+   unless intentionally dispatchable. Use blocked status as the primary
+   non-dispatchable guard.
+
 ## Failure Modes
 - Parent spawned in `/Users/...` or Windows repo path.
 - Missing `prism-full`.
 - `superhermes` appears as assignee.
+- Intake parent created with default `ready` status → auto-dispatched.
+- Workflow skills (`kanban-card-spec`, `kanban-watch`) placed in card
+  `skills` field → worker crashes with `Unknown skill(s)`.
 
 
 ## Parent Dependency Semantics

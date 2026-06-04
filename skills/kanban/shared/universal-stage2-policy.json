@@ -1,6 +1,6 @@
 {
   "policy_id": "universal-kanban-stage2-policy",
-  "version": "1.0",
+  "version": "1.1",
   "required_prism_context": "superhermes",
   "mandatory_prism_full_when_adapter_requires": true,
   "forbidden_assignees": [
@@ -29,6 +29,25 @@
     "parent_done_means_orchestration_setup_complete_not_issue_complete": true,
     "child_execution_depends_on_parent_done": true
   },
+  "intake_parent_cards": {
+    "initial_status_must_be_blocked": true,
+    "must_not_auto_dispatch": true,
+    "spawnable_assignee_forbidden": true,
+    "runtime_worker_skills_only": true,
+    "workflow_skill_metadata_required": true,
+    "operator_skills_used_metadata_required": true,
+    "card_skills_field_means_worker_runtime_skills": true,
+    "allowed_runtime_worker_skills_for_intake_parent": ["prism-full"],
+    "forbidden_runtime_worker_skills_for_intake_parent": [
+      "kanban-card-spec",
+      "kanban-watch",
+      "kanban-review",
+      "kanban-close-gate"
+    ],
+    "workflow_skill_field": "workflow_skill",
+    "operator_skills_used_field": "operator_skills_used",
+    "required_worker_skills_field": "required_skills"
+  },
   "dispatch_semantics": {
     "ready_status_path": "implementation_dispatch",
     "review_status_path": "formal_review_claim_review_task",
@@ -48,6 +67,9 @@
   "skill_availability": {
     "dispatcher_required_skills_checked_before_run_start": true,
     "hardcoded_skill_requirements_must_be_guarded": true,
-    "known_incident": "issue-51-run-88-sdlc-review-missing"
+    "known_incidents": [
+      "issue-51-run-88-sdlc-review-missing",
+      "issue-t_50dd31da-run-90-kanban-card-spec-kanban-watch-unknown"
+    ]
   }
 }
