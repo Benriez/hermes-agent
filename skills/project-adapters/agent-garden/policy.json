@@ -60,6 +60,12 @@
       "issue-t_50dd31da-run-90-kanban-card-spec-kanban-watch-unknown"
     ]
   },
+  "worker_validation": {
+    "universal_validator_adapter_driven": true,
+    "adapter_declares_workers": true,
+    "implementation_worker": "deep-implementer",
+    "review_worker": "minimax-implementer"
+  },
   "role_separation": {
     "gitter_role_explicit_for_commit_push": true
   },

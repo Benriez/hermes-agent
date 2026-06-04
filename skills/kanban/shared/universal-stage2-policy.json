@@ -93,5 +93,12 @@
     "trigger_descriptions_required": true,
     "skill_examples_are_incident_memory": true,
     "deterministic_scripts_preferred_for_gates": true
+  },
+  "worker_validation": {
+    "universal_validator_must_not_hardcode_worker_names": true,
+    "concrete_worker_names_belong_to_project_adapter": true,
+    "universal_validator_validates_only_forbidden_assignees": true,
+    "adapter_declares_implementation_and_review_workers": true,
+    "validate_parent_card_script_is_adapter_driven": true
   }
 }

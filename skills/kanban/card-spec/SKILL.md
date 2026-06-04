@@ -30,7 +30,7 @@ Creates or validates safe Kanban card specifications from operator/project inten
 1. Confirm adapter requires/declares `prism-full` if Stage 2 policy applies.
 2. Verify parent workspace is orchestration-host scratch, not source repo.
 3. Verify repo path is body/metadata only.
-4. Verify implementation/review workers match adapter policy.
+4. Verify workers match adapter policy. Worker names are validated against the adapter's declared workers. No universal worker defaults are assumed. If the adapter does not declare workers, concrete worker validation is skipped.
 5. Run `scripts/validate_parent_card.py` against adapter and candidate card JSON.
 6. Hand off valid cards to `kanban-decompose` or `kanban-implementation`.
 
