@@ -48,7 +48,9 @@
     "must_not_auto_dispatch": true,
     "runtime_worker_skills_only": true,
     "card_skills_field_means_worker_runtime_skills": true,
-    "allowed_runtime_worker_skills": ["prism-full"],
+    "allowed_runtime_worker_skills": [
+      "prism-full"
+    ],
     "forbidden_runtime_worker_skills": [
       "kanban-card-spec",
       "kanban-watch",
@@ -56,9 +58,14 @@
       "kanban-close-gate"
     ],
     "workflow_skill_in_body": "kanban-card-spec",
-    "operator_skills_used_in_body": ["kanban-card-spec", "kanban-watch"],
-    "required_worker_skills_in_body": ["prism-full"],
-    "canonical_create_command": "hermes kanban --board agent-garden create --title 'Stage 1 Intake — <issue>' --initial-status blocked --skills prism-full --body '<body with workflow metadata>'"
+    "operator_skills_used_in_body": [
+      "kanban-card-spec",
+      "kanban-watch"
+    ],
+    "required_worker_skills_in_body": [
+      "prism-full"
+    ],
+    "canonical_create_command": "hermes kanban --board agent-garden create --title 'Stage 1 Intake \u2014 <issue>' --initial-status blocked --skills prism-full --body '<body with workflow metadata>'"
   },
   "rescue_policy": {
     "direct_sqlite_forbidden_in_normal_workflow": true,
@@ -88,5 +95,12 @@
     "trigger_descriptions_required": true,
     "skill_examples_are_incident_memory": true,
     "deterministic_scripts_preferred_for_gates": true
+  },
+  "worker_policy": {
+    "implementation_worker": "deep-implementer",
+    "review_worker": "minimax-implementer",
+    "review_worker_review_only_by_default": true,
+    "do_not_route_review_worker_through_implementation_dispatch": true,
+    "specializes_universal_review_worker_policy": true
   }
 }

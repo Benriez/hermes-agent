@@ -48,7 +48,9 @@
     "workflow_skill_metadata_required": true,
     "operator_skills_used_metadata_required": true,
     "card_skills_field_means_worker_runtime_skills": true,
-    "allowed_runtime_worker_skills_for_intake_parent": ["prism-full"],
+    "allowed_runtime_worker_skills_for_intake_parent": [
+      "prism-full"
+    ],
     "forbidden_runtime_worker_skills_for_intake_parent": [
       "kanban-card-spec",
       "kanban-watch",
@@ -66,9 +68,12 @@
     "do_not_set_review_assignee_card_to_ready": true
   },
   "review_worker": {
-    "minimax_implementer_review_only_by_default": true,
-    "do_not_route_minimax_through_implementation_dispatch": true,
-    "require_explicit_review_pass_or_fail": true
+    "adapter_review_worker_review_only_by_default": true,
+    "do_not_route_adapter_review_worker_through_implementation_dispatch": true,
+    "review_workers_must_use_formal_review_status": true,
+    "implementation_dispatch_must_not_select_adapter_declared_review_worker": true,
+    "require_explicit_review_pass_or_fail": true,
+    "concrete_review_worker_names_belong_to_project_adapter": true
   },
   "sqlite_policy": {
     "normal_workflow_direct_sqlite_forbidden": true,
