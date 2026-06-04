@@ -1,6 +1,6 @@
 ---
 name: kanban-close-gate
-description: "Use before closing a GitHub issue from Kanban. Verifies parent/children done, review pass evidence, tests/browser gates, commit exists and is pushed."
+description: "Use this skill when deciding whether a completed implementation/review workflow is eligible for close-gate pass, pass-with-warnings, fail, or operator-approved GitHub close."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -87,6 +87,11 @@ Missing separate review JSON/TXT files are a **warning, not a failure**, if alte
 ## Remote Verification
 
 Close-gate must verify commit exists on the **actual remote/branch** used in the task, not assume a pre-described remote. Use `git ls-remote <remote> refs/heads/<branch>` to confirm.
+
+## Progressive Disclosure
+- **Gotchas:** `../shared/gotchas.md` — scratch workspace lifecycle, remote verification, null GitHub issue, dirty tree, CLOSE_GATE_PASS_WITH_WARNINGS
+- **Policy:** `../shared/universal-stage2-policy.json`
+- **Full index:** `../shared/index.md`
 
 ## Next Skill Handoff
 - Passed: operator close/comment flow (if GitHub issue exists and operator approves).

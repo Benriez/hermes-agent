@@ -62,5 +62,12 @@
   },
   "role_separation": {
     "gitter_role_explicit_for_commit_push": true
+  },
+  "documentation": {
+    "gotchas_first_class": true,
+    "progressive_disclosure_required": true,
+    "trigger_descriptions_required": true,
+    "skill_examples_are_incident_memory": true,
+    "deterministic_scripts_preferred_for_gates": true
   }
 }

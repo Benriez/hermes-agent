@@ -1,6 +1,6 @@
 ---
 name: kanban-review
-description: "Use when reviewing Kanban implementation output. Requires auditable artifact JSON, report TXT, output log, explicit REVIEW_PASS or REVIEW_FAIL, and adapter review-worker policy."
+description: "Use this skill when moving cards into formal review, validating minimax review eligibility, auditing REVIEW_PASS/FAIL evidence, or preventing ready+minimax dispatch mistakes."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -67,6 +67,11 @@ Missing separate review artifact files is a **warning**, not automatic failure, 
 
 ## Deterministic Scripts
 - `scripts/check_review_evidence.py`
+
+## Progressive Disclosure
+- **Gotchas:** `../shared/gotchas.md` — sdlc-review availability guard, review metadata evidence, dispatch semantics
+- **Policy:** `../shared/universal-stage2-policy.json`
+- **Full index:** `../shared/index.md`
 
 ## Next Skill Handoff
 - REVIEW_PASS: `kanban-close-gate`.

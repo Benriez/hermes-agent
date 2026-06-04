@@ -1,6 +1,6 @@
 ---
 name: kanban-card-spec
-description: "Use when specifying or validating Kanban parent/child cards before dispatch. Ensures prism-full, host, workspace, worker, and metadata gates are correct."
+description: "Use when creating, validating, decomposing, or repairing Hermes Kanban parent/child cards — especially Agent Garden intake, implementation, review, and close-gate workflow cards. Ensures prism-full, host, workspace, worker, and metadata gates are correct."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -51,6 +51,12 @@ Creates or validates safe Kanban card specifications from operator/project inten
 
 ## Deterministic Scripts
 - `scripts/validate_parent_card.py`
+
+## Progressive Disclosure
+- **Gotchas:** `../shared/gotchas.md` — intake rules, runtime vs workflow skills, parent semantics
+- **Incident examples:** `../shared/examples/intake-auto-dispatch-skill-resolution-learning.json`
+- **Policy:** `../shared/universal-stage2-policy.json`
+- **Full index:** `../shared/index.md`
 
 ## Next Skill Handoff
 - Valid parent: `kanban-decompose` or implementation-specific card creation.
