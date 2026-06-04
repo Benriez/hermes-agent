@@ -7941,6 +7941,13 @@ def _default_spawn(
     if task.skills:
         for sk in task.skills:
             if sk and sk != "kanban-worker":
+                if not _resolve_task_skill_in_home(env.get("HERMES_HOME"), sk):
+                    # Skill not available in the worker's HERMES_HOME —
+                    # skip silently so a missing/disabled skill does not
+                    # crash the worker at CLI startup (ValueError: Unknown
+                    # skill(s)). The worker still runs with its lifecycle
+                    # prompt and the rest of its configured skills.
+                    continue
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
