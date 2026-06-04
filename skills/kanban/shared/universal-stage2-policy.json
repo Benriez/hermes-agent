@@ -124,5 +124,18 @@
     "partition_check_unknown_scope_requires_operator_approval": true,
     "partition_check_adapter_specifics_must_be_in_adapter_context": true,
     "partition_check_decision_must_be_explicit": true
+  },
+  "gitter": {
+    "gitter_required_before_close_gate_when_commit_expected": true,
+    "gitter_must_use_explicit_commit_scope": true,
+    "gitter_must_preserve_unrelated_dirty_files": true,
+    "gitter_must_not_force_push": true,
+    "gitter_must_not_close_github_issues_without_operator_approval": true,
+    "gitter_must_not_create_pr_or_merge_without_operator_approval": true,
+    "gitter_must_not_direct_sqlite": true,
+    "gitter_remote_target_is_task_or_adapter_specific": true,
+    "gitter_artifact_or_wiki_commit_requires_explicit_allowance": true,
+    "gitter_decision_must_be_explicit": true,
+    "gitter_uses_explicit_staging_only": true
   }
 }

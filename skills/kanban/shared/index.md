@@ -14,6 +14,7 @@
 | Watch a running card, detect ghost runs | `kanban-watch` | `skills/kanban/watch/SKILL.md` |
 | Validate review evidence, audit REVIEW_PASS | `kanban-review` | `skills/kanban/review/SKILL.md` |
 | Run close-gate, classify pass/fail/warnings | `kanban-close-gate` | `skills/kanban/close-gate/SKILL.md` |
+| Validate commit scope, safe staging, and push before close-gate | `kanban-gitter` | `skills/kanban/gitter/SKILL.md` |
 
 ---
 
@@ -64,6 +65,7 @@ Scripts perform read-only gate checks. JSON output with explicit pass/fail/missi
 | `watch/scripts/check_run_health.py` | Detect dead PID, stale heartbeat, ghost runs | `kanban-watch` |
 | `review/scripts/check_review_evidence.py` | Verify review artifact/report/log exists | `kanban-review` |
 | `close-gate/scripts/check_close_gate.py` | Verify close-gate prerequisites | `kanban-close-gate` |
+| `gitter/scripts/check_gitter_scope.py` | Validate commit scope, safe staging, and push before close-gate | `kanban-gitter` |
 
 Script contract:
 - Python 3, JSON output
@@ -82,6 +84,7 @@ Script contract:
 - **`kanban-watch`** — Runbook/product verification. Detects ghost/stale runs, checks evidence readiness.
 - **`kanban-review`** — Code quality/review. Validates REVIEW_PASS/FAIL evidence, prevents dispatch mistakes.
 - **`kanban-close-gate`** — Release/CI gate. Classifies close eligibility: pass, pass-with-warnings, fail.
+- **`kanban-gitter`** — Commit/push gate. Validates explicit commit scope, safe staging, and push safety before close-gate.
 
 ### Runtime vs Workflow Skills
 
@@ -95,6 +98,7 @@ Script contract:
 - `kanban-watch`
 - `kanban-review`
 - `kanban-close-gate`
+- `kanban-gitter`
 
 **Rule:** Do NOT put operator skills in `card.skills` field. Worker skill resolver cannot load them.
 
@@ -140,4 +144,8 @@ python3 skills/kanban/close-gate/scripts/check_close_gate.py \
   --parent-json <parent.json> \
   --children-json <children.json> \
   --review-artifact <review-artifact.json>
+
+# Validate gitter scope before close-gate
+python3 skills/kanban/gitter/scripts/check_gitter_scope.py \
+  <gitter.json>
 ```

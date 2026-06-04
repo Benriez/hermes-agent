@@ -1,0 +1,46 @@
+{
+  "gitter": {
+    "task": {
+      "task_id": "t_44444444",
+      "adapter": "example-adapter",
+      "project": "example-project",
+      "repo_path": "/path/to/repo",
+      "issue": 45
+    },
+    "git_context": {
+      "branch": "feature/example-task",
+      "remote": "origin",
+      "remote_branch": "refs/heads/feature/example-task",
+      "head_before": "abc1234567890",
+      "head_after": "def9876543210"
+    },
+    "intended_scope": {
+      "files_to_commit": [
+        "src/core/module.py",
+        "reports/output.json"
+      ],
+      "files_to_exclude": [],
+      "allow_artifacts": true,
+      "allow_wiki_files": false,
+      "allow_source_files": true
+    },
+    "commit_plan": {
+      "commit_required": true,
+      "push_required": true,
+      "message": "feat: update core module and include artifact for example task",
+      "body": "Includes generated artifact report."
+    },
+    "safety": {
+      "force_push_allowed": false,
+      "github_issue_close_allowed": false,
+      "pr_allowed": false,
+      "merge_allowed": false,
+      "direct_sqlite_allowed": false
+    },
+    "decision": {
+      "gitter_allowed": true,
+      "requires_operator_approval": false,
+      "reason": "Warns: allow_artifacts is true — artifact files should not be silently committed."
+    }
+  }
+}

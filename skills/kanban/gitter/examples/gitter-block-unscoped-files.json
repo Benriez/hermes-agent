@@ -1,0 +1,43 @@
+{
+  "gitter": {
+    "task": {
+      "task_id": "t_22222222",
+      "adapter": "example-adapter",
+      "project": "example-project",
+      "repo_path": "/path/to/repo",
+      "issue": 43
+    },
+    "git_context": {
+      "branch": "feature/example-task",
+      "remote": "origin",
+      "remote_branch": "refs/heads/feature/example-task",
+      "head_before": "abc1234567890",
+      "head_after": null
+    },
+    "intended_scope": {
+      "files_to_commit": [],
+      "files_to_exclude": [],
+      "allow_artifacts": false,
+      "allow_wiki_files": false,
+      "allow_source_files": true
+    },
+    "commit_plan": {
+      "commit_required": true,
+      "push_required": true,
+      "message": null,
+      "body": null
+    },
+    "safety": {
+      "force_push_allowed": false,
+      "github_issue_close_allowed": false,
+      "pr_allowed": false,
+      "merge_allowed": false,
+      "direct_sqlite_allowed": false
+    },
+    "decision": {
+      "gitter_allowed": true,
+      "requires_operator_approval": false,
+      "reason": "Missing explicit files_to_commit and commit_message."
+    }
+  }
+}

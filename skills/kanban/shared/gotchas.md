@@ -215,6 +215,50 @@ Only non-critical environmental warnings exist. Evaluate warnings for severity; 
 
 ---
 
+## Gitter Gotchas
+
+### Unrelated Files Committed Because No Explicit Gitter Scope
+
+**Symptom:** Artifacts, wiki files, or dirty/untracked files get committed along with the intended task files.
+
+**Cause:** No explicit `files_to_commit` list. Staging used `git add .` or `git add -A` instead of explicit paths. No gitter scope check ran before commit/push.
+
+**Rule:** Kanban gitter flow MUST stage explicit paths only. Never use `git add .` or `git add -A`. Run `check_gitter_scope.py` to validate before committing.
+
+**Canonical fix:** Define `files_to_commit` explicitly in the gitter gate. Stage only those paths. Run the gitter scope checker before committing.
+
+**Reference:** `scripts/check_gitter_scope.py`
+
+---
+
+### Force Push Without Approval Blocks Gitter Gate
+
+**Symptom:** Gitter gate blocks because `force_push_allowed` is true but no operator approval is recorded.
+
+**Cause:** Task context or adapter accidentally set `force_push_allowed: true` without operator approval.
+
+**Rule:** Force push is forbidden by default in Kanban gitter workflows. Set `force_push_allowed: true` only when operator has explicitly approved.
+
+**Canonical fix:** Remove `force_push_allowed` or set it to `false`. Require explicit operator approval for any force-push scenario.
+
+**Reference:** `skills/kanban/gitter/SKILL.md` — Forbidden Actions
+
+---
+
+### GitHub Issue Close or PR From Gitter Without Approval
+
+**Symptom:** Gitter gate blocks because `github_issue_close_allowed`, `pr_allowed`, or `merge_allowed` is true without operator approval.
+
+**Cause:** Task or adapter set GitHub mutation flags without operator authorization.
+
+**Rule:** GitHub issue close, PR creation, and branch merge from gitter require explicit operator approval. Close-gate and operator approval are required separately from commit/push.
+
+**Canonical fix:** Set all GitHub mutation flags to `false`. Operator must explicitly approve these actions through separate authorization.
+
+**Reference:** `skills/kanban/gitter/SKILL.md` — Forbidden Actions
+
+---
+
 ## Evidence Cross-References
 
 ### Source Workflow (Agent Garden incident evidence)

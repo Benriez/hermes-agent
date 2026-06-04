@@ -14,6 +14,7 @@
 | `kanban-watch` | Runbook/product verification | Watch runs, detect ghost/stale runs, check evidence readiness |
 | `kanban-review` | Code quality/review | Validate REVIEW_PASS/FAIL evidence, prevent dispatch mistakes |
 | `kanban-close-gate` | Release/CI gate | Decide close eligibility: pass, pass-with-warnings, fail |
+| `kanban-gitter` | Commit/push gate | Validate explicit commit scope, safe staging, and push before close-gate |
 
 ## Architecture
 
@@ -67,7 +68,7 @@ Adapters live under `skills/project-adapters/<project_id>/` and are loaded by de
 4. Implementation dispatch — adapter-declared implementation worker.
 5. `kanban-watch` — monitor run health and evidence readiness.
 6. `kanban-review` — validate review evidence and REVIEW_PASS/FAIL.
-7. Gitter/committer role — commit/push when requested and gated (future/pending skill role, not an existing skill here).
+7. `kanban-gitter` — validate commit scope, safe staging, and push before close-gate.
 8. `kanban-close-gate` — decide close eligibility.
 9. Record learning — update gotchas/incidents/examples when requested.
 
@@ -81,6 +82,7 @@ Adapters live under `skills/project-adapters/<project_id>/` and are loaded by de
 | `watch/scripts/check_run_health.py` | `kanban-watch` | Detect dead PID, stale heartbeat, ghost runs |
 | `review/scripts/check_review_evidence.py` | `kanban-review` | Verify review artifact/report/log exists |
 | `close-gate/scripts/check_close_gate.py` | `kanban-close-gate` | Verify close-gate prerequisites |
+| `gitter/scripts/check_gitter_scope.py` | `kanban-gitter` | Validate commit scope, safe staging, and push before close-gate |
 
 Script contract: Python 3, JSON output, exit `0`=pass / `1`=fail / `2`=usage error.
 
@@ -89,6 +91,7 @@ Script contract: Python 3, JSON output, exit `0`=pass / `1`=fail / `2`=usage err
 - **Intake parents:** Always use `--initial-status blocked`. Only `prism-full` in runtime skills.
 - **Plan gate:** Before ambiguous or risky implementation dispatch, require a plan with success criteria, non-goals, forbidden actions, bounded scope, and verification strategy.
 - **Partition check:** Before parallel implementation dispatch, require explicit disjoint write scope or operator-approved serialization for conflicts.
+- **Gitter:** Before close-gate when commits are expected, require explicit files_to_commit and block force-push, GitHub mutations, and SQLite writes by default.
 - **`ready` vs `review`:** `ready` = implementation dispatch. `review` = formal review path. Review worker (Agent Garden adapter: `minimax-implementer`) must use `review`.
 - **Parent done:** Means orchestration/decomposition complete only. Child review + close-gate still required.
 - **Direct SQLite:** Rescue-only with operator authorization + artifact evidence.

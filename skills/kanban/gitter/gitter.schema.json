@@ -1,0 +1,175 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Hermes Kanban Gitter",
+  "description": "Universal gitter scope validation gate for Hermes Kanban commit/push safety.",
+  "type": "object",
+  "required": ["gitter"],
+  "properties": {
+    "gitter": {
+      "type": "object",
+      "required": ["task", "git_context", "intended_scope", "commit_plan", "safety", "decision"],
+      "properties": {
+        "task": {
+          "type": "object",
+          "description": "Task identity and adapter context.",
+          "required": ["task_id", "adapter"],
+          "properties": {
+            "task_id": {
+              "type": ["string", "null"],
+              "description": "Kanban task ID."
+            },
+            "adapter": {
+              "type": ["string", "null"],
+              "description": "Project adapter identifier."
+            },
+            "project": {
+              "type": ["string", "null"],
+              "description": "Project name."
+            },
+            "repo_path": {
+              "type": ["string", "null"],
+              "description": "Repository path (adapter-owned, not hardcoded in universal skill)."
+            },
+            "issue": {
+              "type": ["integer", "null"],
+              "description": "GitHub issue number if applicable."
+            }
+          }
+        },
+        "git_context": {
+          "type": "object",
+          "description": "Git context before and after the operation.",
+          "properties": {
+            "branch": {
+              "type": ["string", "null"],
+              "description": "Local branch name."
+            },
+            "remote": {
+              "type": ["string", "null"],
+              "description": "Remote name (e.g. origin). Adapter or task-specific."
+            },
+            "remote_branch": {
+              "type": ["string", "null"],
+              "description": "Remote branch (e.g. refs/heads/main). Adapter or task-specific."
+            },
+            "head_before": {
+              "type": ["string", "null"],
+              "description": "Commit hash before the commit. Null if no prior commit."
+            },
+            "head_after": {
+              "type": ["string", "null"],
+              "description": "Commit hash after the commit. Null if commit not yet made."
+            }
+          }
+        },
+        "intended_scope": {
+          "type": "object",
+          "description": "Explicit commit scope definition.",
+          "properties": {
+            "files_to_commit": {
+              "type": "array",
+              "description": "Explicit list of files to commit. Must be non-empty when commit_required is true.",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "files_to_exclude": {
+              "type": "array",
+              "description": "Files or patterns to exclude from staging even if in working tree.",
+              "items": { "type": "string" },
+              "default": []
+            },
+            "allow_artifacts": {
+              "type": "boolean",
+              "description": "Whether artifact files (e.g. .json artifacts, reports) may be committed. Defaults to false.",
+              "default": false
+            },
+            "allow_wiki_files": {
+              "type": "boolean",
+              "description": "Whether wiki documentation files may be committed. Defaults to false.",
+              "default": false
+            },
+            "allow_source_files": {
+              "type": "boolean",
+              "description": "Whether source code files may be committed. Defaults to true.",
+              "default": true
+            }
+          }
+        },
+        "commit_plan": {
+          "type": "object",
+          "description": "Commit and push plan.",
+          "properties": {
+            "commit_required": {
+              "type": "boolean",
+              "description": "Whether a commit is expected for this task.",
+              "default": true
+            },
+            "push_required": {
+              "type": "boolean",
+              "description": "Whether a push is expected after commit.",
+              "default": true
+            },
+            "message": {
+              "type": ["string", "null"],
+              "description": "Commit message. Required when commit_required is true."
+            },
+            "body": {
+              "type": ["string", "null"],
+              "description": "Optional commit body or extended description."
+            }
+          }
+        },
+        "safety": {
+          "type": "object",
+          "description": "Safety flag overrides — all default false.",
+          "properties": {
+            "force_push_allowed": {
+              "type": "boolean",
+              "description": "Whether force push is permitted for this gitter operation. Defaults to false.",
+              "default": false
+            },
+            "github_issue_close_allowed": {
+              "type": "boolean",
+              "description": "Whether this gitter operation may close a GitHub issue. Defaults to false.",
+              "default": false
+            },
+            "pr_allowed": {
+              "type": "boolean",
+              "description": "Whether this gitter operation may create a pull request. Defaults to false.",
+              "default": false
+            },
+            "merge_allowed": {
+              "type": "boolean",
+              "description": "Whether this gitter operation may merge a branch. Defaults to false.",
+              "default": false
+            },
+            "direct_sqlite_allowed": {
+              "type": "boolean",
+              "description": "Whether direct SQLite writes are permitted. Defaults to false.",
+              "default": false
+            }
+          }
+        },
+        "decision": {
+          "type": "object",
+          "description": "Explicit gitter gate decision.",
+          "required": ["gitter_allowed", "requires_operator_approval"],
+          "properties": {
+            "gitter_allowed": {
+              "type": "boolean",
+              "description": "Whether this gitter operation is allowed to proceed."
+            },
+            "requires_operator_approval": {
+              "type": "boolean",
+              "description": "Whether operator approval is required before proceeding."
+            },
+            "reason": {
+              "type": ["string", "null"],
+              "description": "Human-readable reason for the decision."
+            }
+          }
+        }
+      }
+    }
+  }
+}

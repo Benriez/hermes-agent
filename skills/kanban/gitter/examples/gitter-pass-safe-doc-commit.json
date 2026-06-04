@@ -1,0 +1,50 @@
+{
+  "gitter": {
+    "task": {
+      "task_id": "t_11111111",
+      "adapter": "example-adapter",
+      "project": "example-project",
+      "repo_path": "/path/to/repo",
+      "issue": 42
+    },
+    "git_context": {
+      "branch": "feature/example-task",
+      "remote": "origin",
+      "remote_branch": "refs/heads/feature/example-task",
+      "head_before": "abc1234567890",
+      "head_after": "def9876543210"
+    },
+    "intended_scope": {
+      "files_to_commit": [
+        "src/utils/helper.py",
+        "tests/test_helper.py",
+        "README.md"
+      ],
+      "files_to_exclude": [
+        "*.log",
+        "__pycache__/"
+      ],
+      "allow_artifacts": false,
+      "allow_wiki_files": false,
+      "allow_source_files": true
+    },
+    "commit_plan": {
+      "commit_required": true,
+      "push_required": true,
+      "message": "feat: add helper utility for example task",
+      "body": "Implements the requested helper function with test coverage."
+    },
+    "safety": {
+      "force_push_allowed": false,
+      "github_issue_close_allowed": false,
+      "pr_allowed": false,
+      "merge_allowed": false,
+      "direct_sqlite_allowed": false
+    },
+    "decision": {
+      "gitter_allowed": true,
+      "requires_operator_approval": false,
+      "reason": "Explicit files_to_commit with no force-push, no GitHub mutations, no artifacts. Safe to proceed."
+    }
+  }
+}
