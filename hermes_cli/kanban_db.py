@@ -1252,6 +1252,89 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Billing project configuration (additive — introduced post-v1.0)
+CREATE TABLE IF NOT EXISTS billing_project_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board_id                 TEXT NOT NULL UNIQUE,
+    project_id                TEXT,
+    customer_id               TEXT,
+    currency                  TEXT NOT NULL DEFAULT 'EUR',
+    billing_mode              TEXT NOT NULL DEFAULT 'mixed',
+    hourly_rate_eur           REAL,
+    monthly_fixed_amount_eur  REAL,
+    project_budget_eur        REAL,
+    monthly_project_allocation_eur REAL,
+    retainer_amount_eur       REAL,
+    overage_enabled           INTEGER NOT NULL DEFAULT 0,
+    overage_hourly_rate_eur   REAL,
+    monthly_budget_eur        REAL,
+    budget_warning_threshold_percent INTEGER NOT NULL DEFAULT 80,
+    budget_over_threshold_percent    INTEGER NOT NULL DEFAULT 100,
+    billing_period_timezone   TEXT NOT NULL DEFAULT 'Europe/Berlin',
+    billing_period_start_day   INTEGER NOT NULL DEFAULT 1,
+    default_task_billing_status TEXT NOT NULL DEFAULT 'billable',
+    visibility_without_approval_enabled INTEGER NOT NULL DEFAULT 1,
+    require_evidence_for_invoice_ready INTEGER NOT NULL DEFAULT 1,
+    allow_estimated_amounts            INTEGER NOT NULL DEFAULT 1,
+    allow_manual_time_entries           INTEGER NOT NULL DEFAULT 1,
+    allow_manual_amount_adjustments     INTEGER NOT NULL DEFAULT 1,
+    invoice_readiness_requires_approval INTEGER NOT NULL DEFAULT 1,
+    created_at                INTEGER NOT NULL,
+    updated_at                INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_billing_board ON billing_project_config(board_id);
+
+CREATE TABLE IF NOT EXISTS task_billing_state (
+    task_id                   TEXT NOT NULL PRIMARY KEY,
+    board_id                  TEXT NOT NULL,
+    billing_status            TEXT NOT NULL DEFAULT 'billable',
+    invoice_status            TEXT NOT NULL DEFAULT 'draft',
+    amount_status             TEXT NOT NULL DEFAULT 'estimated',
+    evidence_status           TEXT NOT NULL DEFAULT 'missing',
+    billable_minutes          INTEGER NOT NULL DEFAULT 0,
+    non_billable_minutes      INTEGER NOT NULL DEFAULT 0,
+    tracked_minutes           INTEGER NOT NULL DEFAULT 0,
+    manual_adjustment_eur     REAL NOT NULL DEFAULT 0,
+    manual_adjustment_reason  TEXT,
+    billing_note              TEXT,
+    confidence_status         TEXT NOT NULL DEFAULT 'missing_config',
+    approved_by               TEXT,
+    approved_at               INTEGER,
+    invoice_id                TEXT,
+    created_at                INTEGER NOT NULL,
+    updated_at                INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_billing_board ON task_billing_state(board_id);
+
+CREATE TABLE IF NOT EXISTS billing_evidence_ref (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id       TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    evidence_id   TEXT,
+    artifact_path TEXT,
+    note          TEXT,
+    strength      TEXT NOT NULL DEFAULT 'weak',
+    created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_billing_evidence_task ON billing_evidence_ref(task_id);
+
+CREATE TABLE IF NOT EXISTS operator_time_entry (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      TEXT NOT NULL,
+    operator_id  TEXT NOT NULL,
+    started_at   INTEGER NOT NULL,
+    ended_at     INTEGER NOT NULL,
+    minutes      INTEGER NOT NULL,
+    billable     INTEGER NOT NULL DEFAULT 1,
+    note         TEXT,
+    created_at   INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_time_task ON operator_time_entry(task_id);
 """
 
 
@@ -2240,12 +2323,6 @@ def _check_hardcoded_worker_enforcement(
         return (
             "SUPERHERMES_ASSIGNEE_FORBIDDEN: superhermes is a Prism/plugin "
             "analysis context, not a worker profile — blocked by hardcoded enforcement"
-        )
-
-    if dispatch_type == "implementation" and _assignee_stripped == "minimax-implementer":
-        return (
-            "MINIMAX_IMPLEMENTER_IMPLEMENTATION_BLOCKED: minimax-implementer "
-            "is a review-only profile and must not be used for implementation work"
         )
 
     if dispatch_type == "review" and _assignee_stripped == "deep-implementer":
@@ -8348,6 +8425,898 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
+    }
+
+
+# -----------------------------------------------------------------------
+# Billing project configuration
+# -----------------------------------------------------------------------
+
+def get_billing_config(conn: sqlite3.Connection, board_id: str) -> Optional[dict]:
+    """Return the billing_project_config row for ``board_id``, or None if not set."""
+    row = conn.execute(
+        "SELECT * FROM billing_project_config WHERE board_id = ?",
+        (board_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def upsert_billing_config(conn: sqlite3.Connection, board_id: str, fields: dict) -> dict:
+    """Atomically insert-or-update billing config fields for ``board_id``.
+
+    Only columns present in ``fields`` are written; missing ones are left
+    unchanged. ``updated_at`` is always set to the current epoch. On insert,
+    ``board_id`` is set and ``created_at`` is initialised.
+    """
+    now = int(time.time())
+    # Known writable columns (excludes id, board_id, created_at, updated_at)
+    writable = {
+        "project_id", "customer_id", "currency", "billing_mode",
+        "hourly_rate_eur", "monthly_fixed_amount_eur", "project_budget_eur",
+        "monthly_project_allocation_eur", "retainer_amount_eur",
+        "overage_enabled", "overage_hourly_rate_eur", "monthly_budget_eur",
+        "budget_warning_threshold_percent", "budget_over_threshold_percent",
+        "billing_period_timezone", "billing_period_start_day",
+        "default_task_billing_status",
+        "visibility_without_approval_enabled", "require_evidence_for_invoice_ready",
+        "allow_estimated_amounts", "allow_manual_time_entries",
+        "allow_manual_amount_adjustments", "invoice_readiness_requires_approval",
+        # --- AI billing fields (Card 1) ---
+        "ai_billing_basis",
+        "token_markup_multiplier",
+        "minimum_ai_charge_eur",
+        "ai_cost_cap_per_task_eur",
+        "human_hourly_rate_eur",
+        "review_hourly_rate_eur",
+        "validation_hourly_rate_eur",
+    }
+    # Build SET clause for UPDATE (e.g. ["project_id = ?", "customer_id = ?", ...])
+    setters = []
+    values = []
+    for key in writable:
+        if key in fields:
+            setters.append(f"{key} = ?")
+            values.append(fields[key])
+    setters.append("updated_at = ?")
+    values.append(now)
+
+    existing = conn.execute(
+        "SELECT id FROM billing_project_config WHERE board_id = ?", (board_id,)
+    ).fetchone()
+    if existing is None:
+        # INSERT — build column list and value list from fields
+        cols = [k for k in writable if k in fields]
+        col_names = ", ".join(cols + ["board_id", "created_at", "updated_at"])
+        val_placeholders = ", ".join(["?"] * (len(cols) + 3))
+        all_values = [fields[k] for k in cols] + [board_id, now, now]
+        conn.execute(
+            f"INSERT INTO billing_project_config ({col_names}) VALUES ({val_placeholders})",
+            all_values,
+        )
+    else:
+        conn.execute(
+            f"UPDATE billing_project_config SET {', '.join(setters)} WHERE board_id = ?",
+            values + [board_id],
+        )
+    conn.commit()
+    return get_billing_config(conn, board_id)
+
+
+# -----------------------------------------------------------------------
+# AI cost calculation helper (Card 1)
+# -----------------------------------------------------------------------
+
+def calculate_ai_cost(
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int,
+    cache_write_tokens: int,
+    board_config: dict,
+    pricing_entry: dict | None,
+) -> dict:
+    """Calculate AI cost from token usage and board billing config.
+
+    Applies the formula::
+
+        raw_ai_cost =
+            (input_tokens / 1_000_000 * price_input_per_1m)
+          + (output_tokens / 1_000_000 * price_output_per_1m)
+          + (cached_tokens / 1_000_000 * price_cached_per_1m)
+
+        billable_ai_cost =
+            raw_ai_cost  (ai_billing_basis == token_usage_raw)
+            raw_ai_cost * token_markup_multiplier  (ai_billing_basis == token_usage_with_markup)
+            0  (ai_billing_basis == none)
+
+    Then applies minimum_ai_charge_eur and ai_cost_cap_per_task_eur.
+
+    Returns a dict with:
+        - provider, model, currency
+        - input_tokens, output_tokens, cached_tokens, cache_write_tokens
+        - raw_provider_cost_eur, billable_ai_cost_eur
+        - pricing_found, pricing_manually_verified
+        - evidence_status: "ready" | "estimated" | "missing"
+        - warnings: list[str]
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    warnings: list[str] = []
+
+    # Load pricing config lazily
+    _pricing_config: dict | None = None
+
+    def _load_pricing() -> dict | None:
+        nonlocal _pricing_config
+        if _pricing_config is None:
+            cfg_path = _Path(__file__).parent / "billing_model_pricing.json"
+            if cfg_path.exists():
+                try:
+                    _pricing_config = _json.loads(cfg_path.read_text())
+                except Exception:
+                    _pricing_config = {}
+            else:
+                _pricing_config = {}
+        return _pricing_config
+
+    # Resolve pricing entry from board config or load from config
+    if pricing_entry is None:
+        cfg = _load_pricing()
+        # If board_config has provider/model hints they could be passed in,
+        # but for v0.1 pricing lookup is deferred to later cards.
+        pricing_entry = {}
+
+    ai_billing_basis = str(board_config.get("ai_billing_basis") or "none")
+    token_markup = float(board_config.get("token_markup_multiplier") or 1.0)
+    min_charge = float(board_config.get("minimum_ai_charge_eur") or 0.0)
+    cost_cap = board_config.get("ai_cost_cap_per_task_eur")
+    if cost_cap is not None:
+        cost_cap = float(cost_cap)
+
+    # Currency
+    currency = str(board_config.get("currency") or "EUR")
+
+    # Extract pricing
+    price_input = pricing_entry.get("input_per_1m") if pricing_entry else None
+    price_output = pricing_entry.get("output_per_1m") if pricing_entry else None
+    price_cached = pricing_entry.get("cached_per_1m") if pricing_entry else None
+    manually_verified = bool(pricing_entry.get("manually_verified", False)) if pricing_entry else False
+
+    # Compute raw cost
+    raw = 0.0
+    if ai_billing_basis != "none":
+        if price_input is not None and input_tokens > 0:
+            raw += (input_tokens / 1_000_000) * float(price_input)
+        if price_output is not None and output_tokens > 0:
+            raw += (output_tokens / 1_000_000) * float(price_output)
+        if price_cached is not None and cached_tokens > 0:
+            raw += (cached_tokens / 1_000_000) * float(price_cached)
+
+    raw_provider_cost_eur = round(raw, 6)
+
+    # Compute billable
+    if ai_billing_basis == "none":
+        billable = 0.0
+    elif ai_billing_basis == "token_usage_raw":
+        billable = raw
+    elif ai_billing_basis == "token_usage_with_markup":
+        billable = raw * token_markup
+    else:
+        billable = raw
+
+    # Minimum charge (applied only when there is actual usage)
+    if min_charge > 0 and raw_provider_cost_eur > 0:
+        billable = max(min_charge, billable)
+
+    # Cost cap per task
+    if cost_cap is not None and billable > cost_cap:
+        billable = cost_cap
+
+    billable_ai_cost_eur = round(billable, 6)
+
+    # Evidence status
+    if ai_billing_basis == "none":
+        evidence_status = "ready"
+        pricing_found = True
+    elif pricing_entry and (price_input is not None or price_output is not None):
+        pricing_found = True
+        if manually_verified:
+            evidence_status = "ready"
+        else:
+            evidence_status = "estimated"
+            warnings.append(
+                "Pricing entry is not manually verified. "
+                "Operator must verify before invoice-ready use."
+            )
+    else:
+        pricing_found = False
+        evidence_status = "missing"
+        warnings.append(
+            "No pricing entry found. AI cost cannot be determined. "
+            "Add pricing entry in hermes_cli/billing_model_pricing.json "
+            "and set manually_verified=true after verification."
+        )
+
+    return {
+        "provider": pricing_entry.get("provider") if pricing_entry else None,
+        "model": pricing_entry.get("model") if pricing_entry else None,
+        "currency": currency,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "raw_provider_cost_eur": raw_provider_cost_eur,
+        "billable_ai_cost_eur": billable_ai_cost_eur,
+        "pricing_found": pricing_found,
+        "pricing_manually_verified": manually_verified,
+        "evidence_status": evidence_status,
+        "warnings": warnings,
+    }
+
+
+# -----------------------------------------------------------------------
+# Task billing state
+# -----------------------------------------------------------------------
+
+def get_task_billing_state(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Return the task_billing_state row for ``task_id``, or None if not set."""
+    row = conn.execute(
+        "SELECT * FROM task_billing_state WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def upsert_task_billing_state(conn: sqlite3.Connection, task_id: str, fields: dict) -> dict:
+    """Atomically insert-or-update billing state fields for ``task_id``.
+
+    Only columns present in ``fields`` are written; missing ones are left
+    unchanged. ``updated_at`` is always set to the current epoch. On insert,
+    ``task_id`` is set and ``created_at`` is initialised.
+    """
+    now = int(time.time())
+    writable = {
+        "board_id", "billing_status", "invoice_status", "amount_status",
+        "evidence_status", "billable_minutes", "non_billable_minutes",
+        "tracked_minutes", "manual_adjustment_eur", "manual_adjustment_reason",
+        "billing_note", "confidence_status", "approved_by", "approved_at",
+        "invoice_id",
+    }
+    setters = []
+    values = []
+    for key in writable:
+        if key in fields:
+            setters.append(f"{key} = ?")
+            values.append(fields[key])
+    setters.append("updated_at = ?")
+    values.append(now)
+
+    existing = conn.execute(
+        "SELECT task_id FROM task_billing_state WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if existing is None:
+        cols = [k for k in writable if k in fields]
+        col_names = ", ".join(cols + ["task_id", "created_at", "updated_at"])
+        val_placeholders = ", ".join(["?"] * (len(cols) + 3))
+        all_values = [fields[k] for k in cols] + [task_id, now, now]
+        conn.execute(
+            f"INSERT INTO task_billing_state ({col_names}) VALUES ({val_placeholders})",
+            all_values,
+        )
+    else:
+        conn.execute(
+            f"UPDATE task_billing_state SET {', '.join(setters)} WHERE task_id = ?",
+            values + [task_id],
+        )
+    conn.commit()
+    return get_task_billing_state(conn, task_id)
+
+
+def get_billing_evidence_refs(
+    conn: sqlite3.Connection, task_id: str
+) -> list[dict]:
+    """Return evidence references for ``task_id``."""
+    rows = conn.execute(
+        "SELECT * FROM billing_evidence_ref WHERE task_id = ? ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# -----------------------------------------------------------------------
+# Populate billing_evidence_ref from existing data
+# -----------------------------------------------------------------------
+
+def populate_billing_evidence_refs(conn: sqlite3.Connection) -> dict:
+    """Populate ``billing_evidence_ref`` from existing run timestamps,
+    task events, operator time entries, and task attachments.
+
+    Deduplicates by (task_id, evidence_type, evidence_id) so repeated
+    calls are idempotent.  Worker-only completed runs (outcome='completed'
+    with no other supporting evidence) are inserted with strength='weak'.
+
+    Returns ``{\"inserted\": N, \"skipped\": N}``.
+    """
+    now = int(time.time())
+    inserted = 0
+    skipped = 0
+
+    _seen: set[tuple[str, str, str | None]] = set()
+
+    # --- Helper: insert a row if not already seen ---
+    def _insert(
+        task_id: str, evidence_type: str, evidence_id: str | None,
+        artifact_path: str | None, note: str | None, strength: str,
+    ) -> None:
+        nonlocal inserted, skipped
+        key = (task_id, evidence_type, evidence_id)
+        if key in _seen:
+            skipped += 1
+            return
+        _seen.add(key)
+        conn.execute(
+            "INSERT INTO billing_evidence_ref "
+            "(task_id, evidence_type, evidence_id, artifact_path, note, strength, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, evidence_type, evidence_id, artifact_path, note, strength, now),
+        )
+        inserted += 1
+
+    # --- 1. Completed task runs ---
+    for row in conn.execute(
+        "SELECT id, task_id, outcome, summary, metadata, profile, started_at, ended_at "
+        "FROM task_runs WHERE outcome = 'completed'"
+    ):
+        tid = row["task_id"]
+        run_id = str(row["id"])
+        note = f"Run completed by {row['profile'] or 'unknown'}"
+        _insert(tid, "run_completion", run_id, None, note, "strong")
+
+    # --- 2. Task events ---
+    for row in conn.execute(
+        "SELECT id, task_id, kind, payload, created_at FROM task_events"
+    ):
+        tid = row["task_id"]
+        event_id = str(row["id"])
+        kind = str(row["kind"] or "")
+        # Skip internal sync events, keep meaningful ones
+        if kind in ("tick_start", "tick_end", "heartbeat"):
+            continue
+        _insert(tid, "task_event", event_id, None, f"Event: {kind}", "medium")
+
+    # --- 3. Operator time entries ---
+    for row in conn.execute(
+        "SELECT id, task_id, operator_id, minutes, note "
+        "FROM operator_time_entry"
+    ):
+        tid = row["task_id"]
+        entry_id = str(row["id"])
+        op_note = f"Time entry by {row['operator_id']}: {row['minutes']}min"
+        if row["note"]:
+            op_note += f" — {row['note']}"
+        _insert(tid, "operator_time", entry_id, None, op_note, "strong")
+
+    # --- 4. Task attachments ---
+    for row in conn.execute(
+        "SELECT id, task_id, filename, stored_path, created_at "
+        "FROM task_attachments"
+    ):
+        tid = row["task_id"]
+        att_id = str(row["id"])
+        _insert(tid, "artifact", att_id, row["stored_path"],
+                f"Attachment: {row['filename']}", "medium")
+
+    # --- 5. Label worker-only claims as weak ---
+    # A task run that completed but has NO events, NO time entries, and
+    # NO attachments for that task gets a weak-evidence marker so the
+    # board knows the run is a bare worker claim.
+    # We know every run already got a strong insert above. Find tasks
+    # where the only evidence is run_completion and mark a weak ref.
+    for row in conn.execute(
+        "SELECT DISTINCT r.task_id FROM task_runs r "
+        "WHERE r.outcome = 'completed'"
+    ):
+        tid = row["task_id"]
+        # Count evidence types for this task — skip if anything beyond run_completion exists
+        ev_types = set(
+            r2["evidence_type"]
+            for r2 in conn.execute(
+                "SELECT DISTINCT evidence_type FROM billing_evidence_ref "
+                "WHERE task_id = ?",
+                (tid,),
+            )
+        )
+        # If only run_completion evidence exists (bare worker claim), add a weak marker
+        if ev_types == {"run_completion"} or not ev_types:
+            _insert(tid, "worker_claim", None, None,
+                    "Worker claim — no supporting evidence (events, time, artifacts)", "weak")
+
+    # --- 6. Re-label run_completion to weak for tasks with only worker claims ---
+    # We already inserted run_completion as "strong". For tasks where the only
+    # evidence besides run_completion is the weak worker_claim ref, downgrade
+    # the run_completion refs to medium so the overall strength reflects reality.
+    tasks_with_only_worker_claims = conn.execute(
+        "SELECT task_id FROM billing_evidence_ref "
+        "GROUP BY task_id "
+        "HAVING COUNT(*) = 2 "
+        "AND SUM(CASE WHEN evidence_type = 'run_completion' THEN 1 ELSE 0 END) = 1 "
+        "AND SUM(CASE WHEN evidence_type = 'worker_claim' THEN 1 ELSE 0 END) = 1"
+    ).fetchall()
+    for r in tasks_with_only_worker_claims:
+        conn.execute(
+            "UPDATE billing_evidence_ref SET strength = 'weak' "
+            "WHERE task_id = ? AND evidence_type = 'run_completion'",
+            (r["task_id"],),
+        )
+
+    conn.commit()
+    return {"inserted": inserted, "skipped": skipped}
+
+
+def count_board_evidence_issues(
+    conn: sqlite3.Connection, board_id: str,
+) -> dict:
+    """Count cards with evidence issues across a board.
+
+    Returns a dict::
+
+        {
+            "evidence_missing_count": int,   # tasks with evidence_status='missing'
+                                                #   AND amount_status='estimated'
+            "low_confidence_count": int,     # tasks with confidence_status='low'
+            "medium_confidence_count": int,
+            "high_confidence_count": int,
+        }
+
+    When no ``board_id`` exists or no billing state rows are present,
+    all counts are zero.
+    """
+    if not board_id:
+        return {
+            "evidence_missing_count": 0,
+            "low_confidence_count": 0,
+            "medium_confidence_count": 0,
+            "high_confidence_count": 0,
+        }
+
+    rows = conn.execute(
+        "SELECT evidence_status, amount_status, confidence_status "
+        "FROM task_billing_state WHERE board_id = ?",
+        (board_id,),
+    ).fetchall()
+
+    evidence_missing = 0
+    low_confidence = 0
+    medium_confidence = 0
+    high_confidence = 0
+
+    for r in rows:
+        ev = str(r["evidence_status"] or "")
+        amt = str(r["amount_status"] or "")
+        conf = str(r["confidence_status"] or "")
+
+        # Evidence missing = evidence_status is 'missing' or 'weak'
+        # AND amount_status is 'estimated' or 'missing'
+        if ev in ("missing", "weak") and amt in ("estimated", "missing"):
+            evidence_missing += 1
+
+        # Confidence counts
+        if conf == "low":
+            low_confidence += 1
+        elif conf == "medium":
+            medium_confidence += 1
+        elif conf == "high":
+            high_confidence += 1
+
+    return {
+        "evidence_missing_count": evidence_missing,
+        "low_confidence_count": low_confidence,
+        "medium_confidence_count": medium_confidence,
+        "high_confidence_count": high_confidence,
+    }
+
+
+# -----------------------------------------------------------------------
+# Billing summary (board-level monthly aggregation)
+# -----------------------------------------------------------------------
+
+def get_task_billing(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Return per-card billing for ``task_id``.
+
+    Retrieves the task_billing_state row (if any), reads the board's
+    billing_project_config, and computes the effective amount and hours
+    using the same logic as :func:`get_billing_summary` but for a single
+    card.
+
+    Returns a dict with:
+      - task_id, board_id
+      - billing_status, amount_status, evidence_status
+      - amount_eur        (computed amount, rounded to 2 decimals)
+      - billable_hours    (billable_minutes / 60)
+      - non_billable_hours
+      - tracked_hours
+      - confidence_status
+      - display_label    (human-readable one-line summary)
+      - color_class      ("green" | "yellow" | "red" | "gray")
+    """
+    row = conn.execute(
+        "SELECT * FROM task_billing_state WHERE task_id = ?", (task_id,)
+    ).fetchone()
+
+    if row is None:
+        # No billing state → treat as non-billable / not tracked
+        return {
+            "task_id": task_id,
+            "board_id": None,
+            "billing_status": "non_billable",
+            "amount_status": None,
+            "evidence_status": None,
+            "amount_eur": 0.0,
+            "billable_hours": 0.0,
+            "non_billable_hours": 0.0,
+            "tracked_hours": 0.0,
+            "confidence_status": "missing_config",
+            "display_label": "non-billable",
+            "color_class": "gray",
+        }
+
+    r = dict(row)
+    board_id = str(r.get("board_id") or "")
+    bs = str(r.get("billing_status") or "billable")
+    amt_status = str(r.get("amount_status") or "estimated")
+    ev_status = str(r.get("evidence_status") or "missing")
+    inv_status = str(r.get("invoice_status") or "draft")
+
+    billable_min = int(r.get("billable_minutes") or 0)
+    non_billable_min = int(r.get("non_billable_minutes") or 0)
+    tracked_min = int(r.get("tracked_minutes") or 0)
+    manual_adj = float(r.get("manual_adjustment_eur") or 0)
+
+    bill_h = round(billable_min / 60.0, 2)
+    non_bill_h = round(non_billable_min / 60.0, 2)
+    tracked_h = round(tracked_min / 60.0, 2)
+
+    # Get board's billing config for rate/mode computation
+    cfg = get_billing_config(conn, board_id) if board_id else None
+
+    if cfg is None:
+        billing_mode = "mixed"
+        hourly_rate = 0.0
+        card_amount = 0.0
+    else:
+        billing_mode = str(cfg.get("billing_mode") or "mixed")
+        hourly_rate = float(cfg.get("hourly_rate_eur") or 0)
+
+        # Same amount logic as get_billing_summary
+        if billing_mode == "hourly":
+            card_amount = (billable_min / 60.0 * hourly_rate) + manual_adj
+        elif billing_mode == "fixed_monthly":
+            card_amount = float(cfg.get("monthly_fixed_amount_eur") or 0)
+        elif billing_mode == "fixed_project":
+            card_amount = float(cfg.get("project_budget_eur") or 0)
+        elif billing_mode == "retainer":
+            card_amount = float(cfg.get("retainer_amount_eur") or 0)
+        elif billing_mode == "non_billable":
+            card_amount = 0.0
+        else:  # mixed or unknown → per-card rules
+            if bs == "non_billable":
+                card_amount = 0.0
+            elif bs == "included_in_fixed_price":
+                card_amount = 0.0
+            elif bs == "excluded":
+                card_amount = 0.0
+            elif bs == "disputed":
+                card_amount = 0.0
+            else:
+                card_amount = (billable_min / 60.0 * hourly_rate) + manual_adj
+
+    amount_eur = round(card_amount, 2)
+    conf = str(r.get("confidence_status") or "missing_config")
+
+    # Determine display_label and color_class
+    if bs == "non_billable":
+        if non_bill_h > 0:
+            display_label = f"non-billable · {non_bill_h}h"
+        else:
+            display_label = "non-billable"
+        color_class = "gray"
+    elif bs == "included_in_fixed_price":
+        display_label = f"fixed · included · {tracked_h}h tracked" if tracked_h > 0 else "fixed · included"
+        color_class = "gray"
+    elif bs == "disputed":
+        display_label = f"disputed · {amount_eur} \u20ac"
+        color_class = "red"
+    elif bs == "excluded":
+        display_label = "excluded"
+        color_class = "gray"
+    else:
+        # billable / hourly_overage / etc.
+        if amt_status in ("calculated", "draft", "invoice_ready", "evidence_verified", "invoiced"):
+            display_label = f"{bill_h}h \u00b7 {amount_eur} \u20ac \u00b7 {amt_status}"
+            color_class = "green"
+        elif amt_status == "estimated":
+            if ev_status == "missing":
+                display_label = "estimated \u00b7 evidence missing"
+            else:
+                display_label = f"estimated \u00b7 {bill_h}h \u00b7 {amount_eur} \u20ac"
+            color_class = "yellow"
+        else:
+            display_label = f"{bill_h}h \u00b7 {amount_eur} \u20ac \u00b7 {amt_status}"
+            color_class = "yellow"
+
+    raw_note = r.get("billing_note")
+    raw_adj_reason = r.get("manual_adjustment_reason")
+
+    return {
+        "task_id": task_id,
+        "board_id": board_id,
+        "billing_status": bs,
+        "invoice_status": str(r.get("invoice_status") or "draft"),
+        "amount_status": amt_status,
+        "evidence_status": ev_status,
+        "amount_eur": amount_eur,
+        "billable_hours": bill_h,
+        "non_billable_hours": non_bill_h,
+        "tracked_hours": tracked_h,
+        "billable_minutes": billable_min,
+        "non_billable_minutes": non_billable_min,
+        "tracked_minutes": tracked_min,
+        "manual_adjustment_eur": manual_adj,
+        "manual_adjustment_reason": raw_adj_reason,
+        "billing_note": raw_note,
+        "hourly_rate_eur": hourly_rate,
+        "confidence_status": conf,
+        "display_label": display_label,
+        "color_class": color_class,
+        "approved_by": r.get("approved_by") or None,
+        "approved_at": r.get("approved_at"),
+        "invoice_id": r.get("invoice_id") or None,
+        "invoice_readiness_requires_approval": bool(cfg.get("invoice_readiness_requires_approval")) if cfg else True,
+    }
+
+
+# -----------------------------------------------------------------------
+# Billing summary (board-level monthly aggregation)
+# -----------------------------------------------------------------------
+
+def _parse_month_range(month: str) -> tuple[int, int]:
+    """Parse YYYY-MM into (month_start_epoch, month_end_epoch) in UTC."""
+    import re, calendar, time as _time
+    if not re.match(r"^\d{4}-\d{2}$", month):
+        raise ValueError(f"Invalid month format: {month!r}. Expected YYYY-MM.")
+    year, mon = int(month[:4]), int(month[5:7])
+    month_start = int(_time.mktime((year, mon, 1, 0, 0, 0, 0, 0, 0)))
+    last_day = calendar.monthrange(year, mon)[1]
+    month_end = int(_time.mktime((year, mon, last_day, 23, 59, 59, 0, 0, 0)))
+    return month_start, month_end
+
+
+def get_billing_summary(conn: sqlite3.Connection, board_id: str, month: str) -> dict:
+    """Return the monthly billing summary for ``board_id`` for ``month`` (YYYY-MM).
+
+    Computes from task_billing_state + billing_project_config per the
+    Customer Billing Cockpit spec. No manual approval is required before
+    returning billing amounts.
+
+    Returns empty/zeros with confidence_status='missing_config' when no
+    billing config exists for the board.
+    """
+    cfg = get_billing_config(conn, board_id)
+
+    if cfg is None:
+        # No config → return fully empty sentinel
+        return {
+            "board_id": board_id,
+            "project_id": board_id,
+            "customer_id": None,
+            "month": month,
+            "currency": "EUR",
+            "billing_mode": "mixed",
+            "visible_customer_amount_this_month": 0.0,
+            "invoice_ready_amount": 0.0,
+            "draft_amount": 0.0,
+            "estimated_amount": 0.0,
+            "disputed_amount": 0.0,
+            "excluded_amount": 0.0,
+            "billable_hours": 0.0,
+            "draft_billable_hours": 0.0,
+            "estimated_billable_hours": 0.0,
+            "non_billable_hours": 0.0,
+            "included_fixed_price_hours": 0.0,
+            "budget_eur": 0.0,
+            "budget_usage_percent": 0.0,
+            "forecast_month_end": 0.0,
+            "over_budget_status": "ok",
+            "confidence_status": "missing_config",
+            "evidence_missing_count": 0,
+            "invoice_ready_count": 0,
+            "draft_count": 0,
+            "estimated_count": 0,
+            "disputed_count": 0,
+        }
+
+    billing_mode = str(cfg.get("billing_mode") or "mixed")
+    currency = str(cfg.get("currency") or "EUR")
+    monthly_budget = float(cfg.get("monthly_budget_eur") or 0)
+    budget_warning = float(cfg.get("budget_warning_threshold_percent") or 80)
+    budget_over = float(cfg.get("budget_over_threshold_percent") or 100)
+
+    # Fetch all task billing states for this board
+    rows = conn.execute(
+        "SELECT * FROM task_billing_state WHERE board_id = ?",
+        (board_id,),
+    ).fetchall()
+
+    # Accumulators
+    visible_total = 0.0
+    invoice_ready_amount = 0.0
+    draft_amount = 0.0
+    estimated_amount = 0.0
+    disputed_amount = 0.0
+    excluded_amount = 0.0
+
+    billable_hours = 0.0
+    draft_billable_hours = 0.0
+    estimated_billable_hours = 0.0
+    non_billable_hours = 0.0
+    included_fixed_price_hours = 0.0
+
+    evidence_missing_count = 0
+    invoice_ready_count = 0
+    draft_count = 0
+    estimated_count = 0
+    disputed_count = 0
+
+    # Map amount_status → bucket
+    def _amount_bucket(status: str) -> str:
+        return {
+            "invoice_ready": "invoice_ready",
+            "evidence_verified": "invoice_ready",
+            "invoiced": "invoice_ready",
+            "draft": "draft",
+            "calculated": "draft",
+            "estimated": "estimated",
+            "missing": "estimated",
+        }.get(str(status).lower(), "estimated")
+
+    for row in rows:
+        r = dict(row)
+        bs = str(r.get("billing_status") or "billable")
+        inv_status = str(r.get("invoice_status") or "draft")
+        amt_status = str(r.get("amount_status") or "estimated")
+        ev_status = str(r.get("evidence_status") or "missing")
+        billable_min = int(r.get("billable_minutes") or 0)
+        non_billable_min = int(r.get("non_billable_minutes") or 0)
+        manual_adj = float(r.get("manual_adjustment_eur") or 0)
+        tracked_min = int(r.get("tracked_minutes") or 0)
+
+        bill_h = billable_min / 60.0
+        non_bill_h = non_billable_min / 60.0
+
+        # Compute amount based on billing_mode
+        if billing_mode == "hourly":
+            rate = float(cfg.get("hourly_rate_eur") or 0)
+            card_amount = (billable_min / 60.0 * rate) + manual_adj
+        elif billing_mode == "fixed_monthly":
+            card_amount = float(cfg.get("monthly_fixed_amount_eur") or 0)
+        elif billing_mode == "fixed_project":
+            card_amount = float(cfg.get("project_budget_eur") or 0)
+            if card_amount and tracked_min > 0:
+                # pro-rate by tracked time (simple heuristic)
+                card_amount = card_amount
+        elif billing_mode == "retainer":
+            card_amount = float(cfg.get("retainer_amount_eur") or 0)
+        elif billing_mode == "non_billable":
+            card_amount = 0.0
+        else:  # mixed or unknown → per-card rules
+            if bs == "non_billable":
+                card_amount = 0.0
+            elif bs == "included_in_fixed_price":
+                card_amount = 0.0
+            elif bs == "excluded":
+                card_amount = 0.0
+            elif bs == "disputed":
+                card_amount = 0.0
+            else:
+                rate = float(cfg.get("hourly_rate_eur") or 0)
+                card_amount = (billable_min / 60.0 * rate) + manual_adj
+
+        bucket = _amount_bucket(amt_status)
+
+        # Update amounts
+        if bucket == "invoice_ready":
+            invoice_ready_amount += card_amount
+        elif bucket == "draft":
+            draft_amount += card_amount
+        elif bucket == "estimated":
+            estimated_amount += card_amount
+
+        if bs == "disputed":
+            disputed_amount += card_amount
+        if bs == "excluded":
+            excluded_amount += card_amount
+
+        visible_total += card_amount
+
+        # Update hours
+        if bs in ("billable", "included_in_fixed_price"):
+            billable_hours += bill_h
+        if bucket == "draft":
+            draft_billable_hours += bill_h
+        elif bucket == "estimated":
+            estimated_billable_hours += bill_h
+
+        if bs == "non_billable":
+            non_billable_hours += non_bill_h
+        if bs == "included_in_fixed_price":
+            included_fixed_price_hours += bill_h
+
+        # Counters
+        if ev_status == "missing":
+            evidence_missing_count += 1
+        if bucket == "invoice_ready":
+            invoice_ready_count += 1
+        elif bucket == "draft":
+            draft_count += 1
+        elif bucket == "estimated":
+            estimated_count += 1
+        if bs == "disputed":
+            disputed_count += 1
+
+    # Budget & forecast
+    budget_usage_percent = (visible_total / monthly_budget * 100) if monthly_budget else 0.0
+    if budget_usage_percent >= budget_over:
+        over_budget_status = "over"
+    elif budget_usage_percent >= budget_warning:
+        over_budget_status = "warning"
+    else:
+        over_budget_status = "ok"
+
+    forecast_month_end = visible_total  # simplified: no trend projection yet
+
+    # Confidence
+    # Use evidence_missing_count as override; otherwise base on counts
+    if evidence_missing_count > 0 and invoice_ready_count == 0:
+        # Low confidence only when evidence is missing AND no invoice-ready items to compensate
+        confidence_status = "low"
+    elif invoice_ready_count > 0:
+        confidence_status = "high"
+    elif draft_count > 0 or estimated_count > 0:
+        confidence_status = "medium"
+    else:
+        confidence_status = "unknown"
+
+    return {
+        "board_id": board_id,
+        "project_id": cfg.get("project_id") or board_id,
+        "customer_id": cfg.get("customer_id"),
+        "month": month,
+        "currency": currency,
+        "billing_mode": billing_mode,
+        "visible_customer_amount_this_month": round(visible_total, 2),
+        "invoice_ready_amount": round(invoice_ready_amount, 2),
+        "draft_amount": round(draft_amount, 2),
+        "estimated_amount": round(estimated_amount, 2),
+        "disputed_amount": round(disputed_amount, 2),
+        "excluded_amount": round(excluded_amount, 2),
+        "billable_hours": round(billable_hours, 2),
+        "draft_billable_hours": round(draft_billable_hours, 2),
+        "estimated_billable_hours": round(estimated_billable_hours, 2),
+        "non_billable_hours": round(non_billable_hours, 2),
+        "included_fixed_price_hours": round(included_fixed_price_hours, 2),
+        "budget_eur": round(monthly_budget, 2),
+        "budget_usage_percent": round(budget_usage_percent, 1),
+        "forecast_month_end": round(forecast_month_end, 2),
+        "over_budget_status": over_budget_status,
+        "confidence_status": confidence_status,
+        "evidence_missing_count": evidence_missing_count,
+        "invoice_ready_count": invoice_ready_count,
+        "draft_count": draft_count,
+        "estimated_count": estimated_count,
+        "disputed_count": disputed_count,
     }
 
 

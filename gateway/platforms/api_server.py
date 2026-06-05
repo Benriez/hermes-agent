@@ -334,6 +334,41 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _parse_skill_frontmatter(skill_dir: Path) -> Optional[Dict[str, Any]]:
+    """Parse SKILL.md YAML frontmatter from a skill directory.
+
+    Returns a dict with skill metadata (name, title, description, category, etc.)
+    or None if the file is missing or unparseable.
+    """
+    md_path = skill_dir / "SKILL.md"
+    if not md_path.is_file():
+        return None
+    try:
+        content = md_path.read_text("utf-8")
+        if content.startswith("---"):
+            _, frontmatter, _ = content.split("---", 2)
+            import yaml
+            meta: Dict[str, Any] = yaml.safe_load(frontmatter) or {}
+            return meta
+    except Exception:
+        pass
+    return None
+
+
+def _read_profile_config(profile_dir: Path) -> Dict[str, Any]:
+    """Read a profile's config.yaml and return its contents as a dict."""
+    config_path = profile_dir / "config.yaml"
+    if config_path.is_file():
+        try:
+            import yaml
+            with open(config_path, "r") as f:
+                cfg: Dict[str, Any] = yaml.safe_load(f) or {}
+                return cfg
+        except Exception:
+            pass
+    return {}
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -3084,6 +3119,233 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    # ------------------------------------------------------------------
+    # Profile Skills API
+    # ------------------------------------------------------------------
+
+    async def _handle_profile_skills(self, request: "web.Request") -> "web.Response":
+        """GET /api/profiles/{profile}/skills — list skills for a profile.
+
+        Returns active, available, and inactive skill lists with full metadata.
+        Read-only; requires auth when API key is configured.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.profiles import profile_exists, get_profile_dir
+
+        profile_name = request.match_info["profile"]
+        if not profile_exists(profile_name):
+            return web.json_response(
+                {"error": f"Profile not found: {profile_name}"},
+                status=404,
+            )
+
+        profile_dir = get_profile_dir(profile_name)
+        skills_dir = profile_dir / "skills"
+
+        # Read config for disabled list
+        config = _read_profile_config(profile_dir)
+        disabled_skills = set(config.get("skills", {}).get("disabled", []) or [])
+
+        # Scan skills directory for SKILL.md frontmatter
+        available_skills: List[Dict[str, Any]] = []
+        if skills_dir.is_dir():
+            for skill_dir in sorted(skills_dir.iterdir()):
+                if skill_dir.is_dir():
+                    meta = _parse_skill_frontmatter(skill_dir)
+                    if meta and meta.get("name"):
+                        name = meta["name"]
+                        is_disabled = name in disabled_skills
+                        skill_entry = {
+                            "id": name,
+                            "name": name,
+                            "title": meta.get("title", ""),
+                            "description": meta.get("description", ""),
+                            "category": meta.get("category", ""),
+                            "source_path": str(skill_dir / "SKILL.md"),
+                            "capabilities": meta.get("capabilities", []),
+                            "status": "disabled" if is_disabled else "enabled",
+                        }
+                        available_skills.append(skill_entry)
+
+        active_skills = [s for s in available_skills if s["status"] == "enabled"]
+        inactive_skills = [s for s in available_skills if s["status"] == "disabled"]
+
+        return web.json_response({
+            "profile": profile_name,
+            "active_skills": active_skills,
+            "available_skills": available_skills,
+            "inactive_skills": inactive_skills,
+        })
+
+    async def _handle_profile_skills_add(self, request: "web.Request") -> "web.Response":
+        """POST /api/profiles/{profile}/skills/add — enable a skill.
+
+        Removes the skill name from config.yaml skills.disabled list.
+        Idempotent: returns already_enabled if the skill is already enabled.
+        Never deletes skill files.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.profiles import profile_exists, get_profile_dir
+        from utils import atomic_yaml_write
+
+        profile_name = request.match_info["profile"]
+        if not profile_exists(profile_name):
+            return web.json_response(
+                {"error": f"Profile not found: {profile_name}"},
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON in request body"},
+                status=400,
+            )
+
+        skill_name = body.get("skill")
+        if not skill_name or not isinstance(skill_name, str):
+            return web.json_response(
+                {"error": "Missing or invalid 'skill' field"},
+                status=400,
+            )
+
+        profile_dir = get_profile_dir(profile_name)
+        skills_dir = profile_dir / "skills"
+
+        # Validate skill exists in profile's skills directory
+        skill_found = False
+        if skills_dir.is_dir():
+            for skill_dir in skills_dir.iterdir():
+                if skill_dir.is_dir():
+                    meta = _parse_skill_frontmatter(skill_dir)
+                    if meta and meta.get("name") == skill_name:
+                        skill_found = True
+                        break
+
+        if not skill_found:
+            return web.json_response(
+                {"error": f"Skill not found: {skill_name}"},
+                status=404,
+            )
+
+        # Read current config
+        config = _read_profile_config(profile_dir)
+        skills_cfg = config.setdefault("skills", {})
+        disabled_list = skills_cfg.setdefault("disabled", [])
+        if disabled_list is None:
+            disabled_list = []
+            skills_cfg["disabled"] = disabled_list
+
+        # Check idempotency: already enabled
+        if skill_name not in disabled_list:
+            return web.json_response({
+                "profile": profile_name,
+                "skill": skill_name,
+                "status": "already_enabled",
+            })
+
+        # Remove from disabled list to enable
+        disabled_list[:] = [s for s in disabled_list if s != skill_name]
+        atomic_yaml_write(profile_dir / "config.yaml", config)
+
+        return web.json_response({
+            "profile": profile_name,
+            "skill": skill_name,
+            "status": "enabled",
+        })
+
+    async def _handle_profile_skills_remove(self, request: "web.Request") -> "web.Response":
+        """POST /api/profiles/{profile}/skills/remove — disable a skill.
+
+        Adds the skill name to config.yaml skills.disabled list.
+        Idempotent: returns already_disabled if the skill is already disabled.
+        Never deletes skill files.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        from hermes_cli.profiles import profile_exists, get_profile_dir
+        from utils import atomic_yaml_write
+
+        profile_name = request.match_info["profile"]
+        if not profile_exists(profile_name):
+            return web.json_response(
+                {"error": f"Profile not found: {profile_name}"},
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": "Invalid JSON in request body"},
+                status=400,
+            )
+
+        skill_name = body.get("skill")
+        if not skill_name or not isinstance(skill_name, str):
+            return web.json_response(
+                {"error": "Missing or invalid 'skill' field"},
+                status=400,
+            )
+
+        profile_dir = get_profile_dir(profile_name)
+        skills_dir = profile_dir / "skills"
+
+        # Validate skill exists in profile's skills directory
+        skill_found = False
+        if skills_dir.is_dir():
+            for skill_dir in skills_dir.iterdir():
+                if skill_dir.is_dir():
+                    meta = _parse_skill_frontmatter(skill_dir)
+                    if meta and meta.get("name") == skill_name:
+                        skill_found = True
+                        break
+
+        if not skill_found:
+            return web.json_response(
+                {"error": f"Skill not found: {skill_name}"},
+                status=404,
+            )
+
+        # Read current config
+        config = _read_profile_config(profile_dir)
+        skills_cfg = config.setdefault("skills", {})
+        disabled_list = skills_cfg.setdefault("disabled", [])
+        if disabled_list is None:
+            disabled_list = []
+            skills_cfg["disabled"] = disabled_list
+
+        # Check idempotency: already disabled
+        if skill_name in disabled_list:
+            return web.json_response({
+                "profile": profile_name,
+                "skill": skill_name,
+                "status": "already_disabled",
+            })
+
+        # Add to disabled list to disable
+        disabled_list.append(skill_name)
+        atomic_yaml_write(profile_dir / "config.yaml", config)
+
+        return web.json_response({
+            "profile": profile_name,
+            "skill": skill_name,
+            "status": "disabled",
+        })
+
+    # ------------------------------------------------------------------
+    # Cron jobs management API
+    # ------------------------------------------------------------------
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -4040,6 +4302,294 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_get_billing_config(self, request: "web.Request") -> "web.Response":
+        """GET /api/boards/{board}/billing-config — return the billing config for a board."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        board = request.match_info["board"]
+        if not board:
+            return web.json_response(
+                _openai_error("board is required", code="invalid_board"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+
+            normed = kb._normalize_board_slug(board)
+        except ValueError:
+            return web.json_response(
+                _openai_error(f"Invalid board slug: {board}", code="invalid_board"), status=400
+            )
+
+        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+            return web.json_response(
+                _openai_error(f"Board not found: {board}", code="board_not_found"), status=404
+            )
+
+        try:
+            with kb.connect(board=normed) as conn:
+                cfg = kb.get_billing_config(conn, normed)
+        except Exception as exc:
+            logger.exception("[api_server] get_billing_config failed for board %s", normed)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        if cfg is None:
+            return web.json_response(
+                _openai_error(
+                    f"No billing config for board {board}",
+                    code="billing_config_not_found"
+                ),
+                status=404,
+            )
+
+        return web.json_response({"object": "hermes.billing_config", "board": normed, "config": cfg})
+
+    async def _handle_patch_billing_config(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/boards/{board}/billing-config — update billing config fields."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        board = request.match_info["board"]
+        if not board:
+            return web.json_response(
+                _openai_error("board is required", code="invalid_board"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+
+            normed = kb._normalize_board_slug(board)
+        except ValueError:
+            return web.json_response(
+                _openai_error(f"Invalid board slug: {board}", code="invalid_board"), status=400
+            )
+
+        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+            return web.json_response(
+                _openai_error(f"Board not found: {board}", code="board_not_found"), status=404
+            )
+
+        try:
+            body, err = await self._read_json_body(request)
+            if err:
+                return err
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(f"Invalid JSON: {exc}", code="invalid_json"), status=400
+            )
+
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object", code="invalid_body"), status=400
+            )
+
+        writable = {
+            "project_id", "customer_id", "currency", "billing_mode",
+            "hourly_rate_eur", "monthly_fixed_amount_eur", "project_budget_eur",
+            "monthly_project_allocation_eur", "retainer_amount_eur",
+            "overage_enabled", "overage_hourly_rate_eur", "monthly_budget_eur",
+            "budget_warning_threshold_percent", "budget_over_threshold_percent",
+            "billing_period_timezone", "billing_period_start_day",
+            "default_task_billing_status",
+            "visibility_without_approval_enabled", "require_evidence_for_invoice_ready",
+            "allow_estimated_amounts", "allow_manual_time_entries",
+            "allow_manual_amount_adjustments", "invoice_readiness_requires_approval",
+            # --- AI billing fields (Card 1) ---
+            "ai_billing_basis",
+            "token_markup_multiplier",
+            "minimum_ai_charge_eur",
+            "ai_cost_cap_per_task_eur",
+            "human_hourly_rate_eur",
+            "review_hourly_rate_eur",
+            "validation_hourly_rate_eur",
+        }
+        fields = {k: v for k, v in body.items() if k in writable}
+        if not fields:
+            return web.json_response(
+                _openai_error(
+                    "No writable fields in request. Valid fields: " + ", ".join(sorted(writable)),
+                    code="no_fields",
+                ),
+                status=400,
+            )
+
+        try:
+            with kb.connect(board=normed) as conn:
+                cfg = kb.upsert_billing_config(conn, normed, fields)
+        except Exception as exc:
+            logger.exception("[api_server] patch_billing_config failed for board %s", normed)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        return web.json_response(
+            {"object": "hermes.billing_config", "board": normed, "config": cfg}
+        )
+
+    async def _handle_get_task_billing(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/tasks/{taskId}/billing — return the billing state for a task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = request.match_info.get("taskId")
+        if not task_id:
+            return web.json_response(
+                _openai_error("taskId is required", code="invalid_task_id"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+        except Exception as exc:
+            logger.exception("[api_server] failed to import kanban_db")
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        try:
+            with kb.connect() as conn:
+                state = kb.get_task_billing_state(conn, task_id)
+        except Exception as exc:
+            logger.exception("[api_server] get_task_billing failed for task %s", task_id)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        if state is None:
+            return web.json_response(
+                _openai_error(f"Task billing state not found: {task_id}", code="not_found"),
+                status=404,
+            )
+
+        return web.json_response({"object": "hermes.task_billing_state", "task_id": task_id, "state": state})
+
+    async def _handle_patch_task_billing(self, request: "web.Request") -> "web.Response":
+        """PATCH /api/kanban/tasks/{taskId}/billing — update billing state fields for a task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = request.match_info.get("taskId")
+        if not task_id:
+            return web.json_response(
+                _openai_error("taskId is required", code="invalid_task_id"), status=400
+            )
+
+        try:
+            body, err = await self._read_json_body(request)
+            if err:
+                return err
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(f"Invalid JSON: {exc}", code="invalid_json"), status=400
+            )
+
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object", code="invalid_body"), status=400
+            )
+
+        writable = {
+            "board_id", "billing_status", "invoice_status", "amount_status",
+            "evidence_status", "billable_minutes", "non_billable_minutes",
+            "tracked_minutes", "manual_adjustment_eur", "manual_adjustment_reason",
+            "billing_note", "confidence_status", "approved_by", "approved_at",
+            "invoice_id",
+        }
+        fields = {k: v for k, v in body.items() if k in writable}
+        if not fields:
+            return web.json_response(
+                _openai_error(
+                    "No writable fields in request. Valid fields: " + ", ".join(sorted(writable)),
+                    code="no_fields",
+                ),
+                status=400,
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+
+            # --- Invoice-ready approval check ---
+            new_inv_status = str(fields.get("invoice_status", "")).strip().lower()
+            if new_inv_status in ("invoice_ready", "invoiced"):
+                board_id = fields.get("board_id") or kb.get_current_board() or "default"
+                with kb.connect() as conn:
+                    cfg = kb.get_billing_config(conn, board_id)
+                requires_approval = bool(
+                    cfg.get("invoice_readiness_requires_approval")
+                ) if cfg else True
+                if requires_approval:
+                    if not fields.get("approved_by") or not fields.get("approved_at"):
+                        return web.json_response(
+                            _openai_error(
+                                f"Setting invoice_status to {new_inv_status!r} requires "
+                                f"'approved_by' and 'approved_at' when "
+                                f"invoice_readiness_requires_approval is enabled.",
+                                code="approval_required",
+                            ),
+                            status=400,
+                        )
+
+            with kb.connect() as conn:
+                state = kb.upsert_task_billing_state(conn, task_id, fields)
+        except Exception as exc:
+            logger.exception("[api_server] patch_task_billing failed for task %s", task_id)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        return web.json_response(
+            {"object": "hermes.task_billing_state", "task_id": task_id, "state": state}
+        )
+
+    async def _handle_get_billing_summary(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/boards/:boardId/billing-summary?month=YYYY-MM — monthly billing summary."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        board_id = request.match_info.get("boardId")
+        if not board_id:
+            return web.json_response(
+                _openai_error("boardId is required", code="invalid_board_id"), status=400
+            )
+
+        month = request.query.get("month", "").strip()
+        if not month:
+            return web.json_response(
+                _openai_error("month query parameter is required (format: YYYY-MM)", code="invalid_month"),
+                status=400,
+            )
+        import re
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            return web.json_response(
+                _openai_error("month must be in YYYY-MM format", code="invalid_month"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+        except Exception as exc:
+            logger.exception("[api_server] failed to import kanban_db")
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        try:
+            with kb.connect(board=board_id) as conn:
+                summary = kb.get_billing_summary(conn, board_id, month)
+        except Exception as exc:
+            logger.exception("[api_server] get_billing_summary failed for board %s month %s", board_id, month)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        return web.json_response({"object": "hermes.billing_summary", "summary": summary})
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -4110,6 +4660,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # Profile skills API
+            self._app.router.add_get("/api/profiles/{profile}/skills", self._handle_profile_skills)
+            self._app.router.add_post("/api/profiles/{profile}/skills/add", self._handle_profile_skills_add)
+            self._app.router.add_post("/api/profiles/{profile}/skills/remove", self._handle_profile_skills_remove)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
@@ -4125,6 +4679,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Board billing config API
+            self._app.router.add_get("/api/boards/{board}/billing-config", self._handle_get_billing_config)
+            self._app.router.add_patch("/api/boards/{board}/billing-config", self._handle_patch_billing_config)
+            # Task billing state API
+            self._app.router.add_get("/api/kanban/tasks/{taskId}/billing", self._handle_get_task_billing)
+            self._app.router.add_patch("/api/kanban/tasks/{taskId}/billing", self._handle_patch_task_billing)
+            # Board billing summary API (monthly aggregation — no approval required)
+            self._app.router.add_get("/api/kanban/boards/{boardId}/billing-summary", self._handle_get_billing_summary)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
