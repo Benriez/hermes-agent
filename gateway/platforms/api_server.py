@@ -4547,6 +4547,133 @@ class APIServerAdapter(BasePlatformAdapter):
             {"object": "hermes.task_billing_state", "task_id": task_id, "state": state}
         )
 
+    # ------------------------------------------------------------------
+    # AI usage per task/run — Card 2 read-only endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_get_ai_usage_for_task(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/tasks/{taskId}/ai-usage — all run usage records for a task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = request.match_info.get("taskId")
+        if not task_id:
+            return web.json_response(
+                _openai_error("taskId is required", code="invalid_task_id"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+            board = request.query.get("board", "default")
+            with kb.connect(board=board) as conn:
+                records = kb.list_kanban_ai_usage_for_task(conn, task_id, board)
+        except Exception as exc:
+            logger.exception("[api_server] get_ai_usage_for_task failed for task %s", task_id)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        return web.json_response({
+            "object": "hermes.task_ai_usage_list",
+            "task_id": task_id,
+            "board": board,
+            "usage_records": records,
+            "count": len(records),
+        })
+
+    async def _handle_get_ai_usage_for_run(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/tasks/{taskId}/runs/{runId}/ai-usage — usage records for a specific run."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = request.match_info.get("taskId")
+        run_id_str = request.match_info.get("runId")
+        if not task_id or not run_id_str:
+            return web.json_response(
+                _openai_error("taskId and runId are required", code="invalid_params"), status=400
+            )
+        try:
+            run_id = int(run_id_str)
+        except ValueError:
+            return web.json_response(
+                _openai_error("runId must be an integer", code="invalid_run_id"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+            board = request.query.get("board", "default")
+            with kb.connect(board=board) as conn:
+                records = kb.list_kanban_ai_usage_for_run(conn, task_id, run_id, board)
+        except Exception as exc:
+            logger.exception("[api_server] get_ai_usage_for_run failed for task %s run %s", task_id, run_id)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        return web.json_response({
+            "object": "hermes.run_ai_usage_list",
+            "task_id": task_id,
+            "run_id": run_id,
+            "board": board,
+            "usage_records": records,
+            "count": len(records),
+        })
+
+    async def _handle_get_ai_cost_summary(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/tasks/{taskId}/ai-cost-summary — aggregated AI cost summary for a task."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        task_id = request.match_info.get("taskId")
+        if not task_id:
+            return web.json_response(
+                _openai_error("taskId is required", code="invalid_task_id"), status=400
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+            board = request.query.get("board", "default")
+            with kb.connect(board=board) as conn:
+                summary = kb.summarize_kanban_ai_usage_for_task(conn, task_id, board)
+        except Exception as exc:
+            logger.exception("[api_server] get_ai_cost_summary failed for task %s", task_id)
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        # Attach pricing warnings from billing config
+        try:
+            from hermes_cli import kanban_db as kb
+            with kb.connect(board=board) as conn:
+                cfg = kb.get_billing_config(conn, board)
+            ai_basis = (cfg or {}).get("ai_billing_basis", "none")
+        except Exception:
+            ai_basis = "unknown"
+
+        warnings = []
+        if ai_basis not in ("token_usage_raw", "token_usage_with_markup"):
+            warnings.append(
+                f"AI billing basis is '{ai_basis}'. AI usage cost will be 0 unless "
+                "board billing config is set to token_usage_raw or token_usage_with_markup."
+            )
+        if summary.get("evidence_status") in ("missing", "estimated"):
+            warnings.append(
+                f"Evidence status is '{summary.get('evidence_status')}'. "
+                "Pricing entries are not manually verified. Not invoice-ready."
+            )
+
+        return web.json_response({
+            "object": "hermes.task_ai_cost_summary",
+            "task_id": task_id,
+            "board": board,
+            "ai_billing_basis": ai_basis,
+            "summary": summary,
+            "warnings": warnings,
+        })
+
     async def _handle_get_billing_summary(self, request: "web.Request") -> "web.Response":
         """GET /api/kanban/boards/:boardId/billing-summary?month=YYYY-MM — monthly billing summary."""
         auth_err = self._check_auth(request)
@@ -4685,6 +4812,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # Task billing state API
             self._app.router.add_get("/api/kanban/tasks/{taskId}/billing", self._handle_get_task_billing)
             self._app.router.add_patch("/api/kanban/tasks/{taskId}/billing", self._handle_patch_task_billing)
+            # AI usage per task/run — Card 2 read-only
+            self._app.router.add_get("/api/kanban/tasks/{taskId}/ai-usage", self._handle_get_ai_usage_for_task)
+            self._app.router.add_get("/api/kanban/tasks/{taskId}/runs/{runId}/ai-usage", self._handle_get_ai_usage_for_run)
+            self._app.router.add_get("/api/kanban/tasks/{taskId}/ai-cost-summary", self._handle_get_ai_cost_summary)
             # Board billing summary API (monthly aggregation — no approval required)
             self._app.router.add_get("/api/kanban/boards/{boardId}/billing-summary", self._handle_get_billing_summary)
             # Store the adapter after native routes are registered. Local Hermes-Relay

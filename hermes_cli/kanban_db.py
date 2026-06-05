@@ -8657,6 +8657,314 @@ def calculate_ai_cost(
 
 
 # -----------------------------------------------------------------------
+# Kanban AI run usage — persistence via task_runs.metadata JSON
+# -----------------------------------------------------------------------
+# Card 2: Persist normalized LLM usage per Kanban task/run.
+# Uses the existing task_runs.metadata JSON field (no new table).
+# Runtime hook (HERMES_KANBAN_TASK context) deferred to Card 2b.
+
+def record_kanban_ai_usage(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    board_id: str,
+    usage: dict,
+) -> dict:
+    """Append a normalized AI usage record to task_runs.metadata JSON.
+
+    Reads existing metadata JSON, appends the usage record to the
+    ``ai_usage_records`` array, and writes back. Idempotent — multiple
+    calls accumulate records (one per model call / API turn).
+
+    Args:
+        conn: Kanban SQLite connection
+        task_id: Kanban task id
+        run_id: task_runs.id this usage belongs to
+        board_id: board slug (for validation)
+        usage: normalized usage dict with keys:
+            - provider, model
+            - input_tokens, output_tokens, cached_tokens, reasoning_tokens
+            - session_id (may be None)
+            - pricing_source
+            - pricing_found, pricing_manually_verified
+            - raw_provider_cost_eur, billable_ai_cost_eur
+            - evidence_status: "missing" | "estimated" | "ready"
+
+    Returns:
+        The updated run record dict (with metadata JSON)
+    """
+    now = int(time.time())
+    entry = {
+        "provider": str(usage.get("provider") or "unknown"),
+        "model": str(usage.get("model") or "unknown"),
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "cached_tokens": int(usage.get("cached_tokens") or 0),
+        "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
+        "session_id": usage.get("session_id"),
+        "pricing_source": str(usage.get("pricing_source") or "unknown"),
+        "pricing_found": bool(usage.get("pricing_found", False)),
+        "pricing_manually_verified": bool(usage.get("pricing_manually_verified", False)),
+        "raw_provider_cost_eur": _float_or_none(usage.get("raw_provider_cost_eur")),
+        "billable_ai_cost_eur": _float_or_none(usage.get("billable_ai_cost_eur")),
+        "evidence_status": str(usage.get("evidence_status") or "missing"),
+        "recorded_at": now,
+    }
+
+    # Read existing metadata
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if row is None:
+        return {}
+
+    existing_meta = {}
+    if row[0]:
+        try:
+            existing_meta = json.loads(row[0])
+        except Exception:
+            existing_meta = {}
+
+    records = existing_meta.get("ai_usage_records", [])
+    if not isinstance(records, list):
+        records = []
+    records.append(entry)
+
+    existing_meta["ai_usage_records"] = records
+    new_meta = json.dumps(existing_meta, ensure_ascii=False)
+
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (new_meta, run_id),
+    )
+    conn.commit()
+
+    return {"id": run_id, "task_id": task_id, "metadata": new_meta}
+
+
+def list_kanban_ai_usage_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    board_id: str,
+) -> list[dict]:
+    """Return all AI usage records across all runs for a task.
+
+    Args:
+        conn: Kanban SQLite connection
+        task_id: Kanban task id
+        board_id: board slug (unused in v0.1, reserved for future isolation)
+
+    Returns:
+        List of usage record dicts, newest first by recorded_at.
+    """
+    rows = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? ORDER BY started_at DESC",
+        (task_id,),
+    ).fetchall()
+
+    all_records = []
+    for run_id, meta_json in rows:
+        if not meta_json:
+            continue
+        try:
+            meta = json.loads(meta_json)
+        except Exception:
+            continue
+        records = meta.get("ai_usage_records", [])
+        if not isinstance(records, list):
+            continue
+        for rec in records:
+            rec = dict(rec)
+            rec["run_id"] = run_id
+            all_records.append(rec)
+
+    all_records.sort(key=lambda x: x.get("recorded_at", 0), reverse=True)
+    return all_records
+
+
+def list_kanban_ai_usage_for_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    board_id: str,
+) -> list[dict]:
+    """Return AI usage records for a specific run.
+
+    Args:
+        conn: Kanban SQLite connection
+        task_id: Kanban task id
+        run_id: task_runs.id
+        board_id: board slug (unused in v0.1)
+
+    Returns:
+        List of usage record dicts, newest first.
+    """
+    row = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if row is None or not row[1]:
+        return []
+
+    try:
+        meta = json.loads(row[1])
+    except Exception:
+        return []
+
+    records = meta.get("ai_usage_records", [])
+    if not isinstance(records, list):
+        return []
+
+    result = []
+    for rec in records:
+        r = dict(rec)
+        r["run_id"] = run_id
+        result.append(r)
+    result.sort(key=lambda x: x.get("recorded_at", 0), reverse=True)
+    return result
+
+
+def summarize_kanban_ai_usage_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    board_id: str,
+) -> dict:
+    """Aggregate AI usage across all runs for a task.
+
+    Sums input/output/cached/reasoning tokens per provider/model.
+    Attempts to calculate raw and billable AI cost per run using
+    calculate_ai_cost() from Card 1.
+
+    Args:
+        conn: Kanban SQLite connection
+        task_id: Kanban task id
+        board_id: board slug (used to load board billing config)
+
+    Returns:
+        Dict with:
+            - task_id, board_id
+            - run_count
+            - total_input_tokens, total_output_tokens, total_cached_tokens,
+              total_reasoning_tokens, total_tokens
+            - runs: list of per-run summaries
+            - pricing_warnings: list of warnings
+            - evidence_status: "missing" | "estimated" | "ready" (worst across runs)
+    """
+    import pathlib as _pathlib
+
+    rows = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? ORDER BY started_at ASC",
+        (task_id,),
+    ).fetchall()
+
+    run_summaries = []
+    total_input = total_output = total_cached = total_reasoning = 0
+    worst_evidence = "ready"
+    pricing_warnings = []
+
+    for run_id, meta_json in rows:
+        if not meta_json:
+            continue
+        try:
+            meta = json.loads(meta_json)
+        except Exception:
+            continue
+
+        records = meta.get("ai_usage_records", [])
+        if not isinstance(records, list) or not records:
+            continue
+
+        run_input = run_output = run_cached = run_reasoning = 0
+        run_raw = 0.0
+        run_billable = 0.0
+        run_pricing_found = False
+        run_pricing_verified = False
+
+        for rec in records:
+            rec = dict(rec)
+            run_input += rec.get("input_tokens", 0)
+            run_output += rec.get("output_tokens", 0)
+            run_cached += rec.get("cached_tokens", 0)
+            run_reasoning += rec.get("reasoning_tokens", 0)
+
+            if rec.get("pricing_found"):
+                run_pricing_found = True
+            if rec.get("pricing_manually_verified"):
+                run_pricing_verified = True
+
+            r = rec.get("raw_provider_cost_eur")
+            if r is not None:
+                run_raw += float(r)
+
+            b = rec.get("billable_ai_cost_eur")
+            if b is not None:
+                run_billable += float(b)
+
+            ev = rec.get("evidence_status", "missing")
+            if ev == "missing":
+                worst_evidence = "missing"
+            elif ev == "estimated" and worst_evidence == "ready":
+                worst_evidence = "estimated"
+
+        total_input += run_input
+        total_output += run_output
+        total_cached += run_cached
+        total_reasoning += run_reasoning
+
+        run_summaries.append({
+            "run_id": run_id,
+            "input_tokens": run_input,
+            "output_tokens": run_output,
+            "cached_tokens": run_cached,
+            "reasoning_tokens": run_reasoning,
+            "total_tokens": run_input + run_output,
+            "raw_provider_cost_eur": round(run_raw, 6),
+            "billable_ai_cost_eur": round(run_billable, 6),
+            "pricing_found": run_pricing_found,
+            "pricing_manually_verified": run_pricing_verified,
+        })
+
+    # Load board billing config for evidence context
+    board_config = get_billing_config(conn, board_id) or {}
+    ai_basis = board_config.get("ai_billing_basis", "none")
+
+    if ai_basis == "none":
+        # No AI billing — cost is 0
+        total_billable = 0.0
+    else:
+        # Aggregate from records
+        total_billable = sum(r["billable_ai_cost_eur"] for r in run_summaries)
+
+    return {
+        "task_id": task_id,
+        "board_id": board_id,
+        "run_count": len(run_summaries),
+        "total_input_tokens": total_input,
+        "total_output_tokens": total_output,
+        "total_cached_tokens": total_cached,
+        "total_reasoning_tokens": total_reasoning,
+        "total_tokens": total_input + total_output,
+        "total_raw_provider_cost_eur": round(sum(r["raw_provider_cost_eur"] for r in run_summaries), 6),
+        "total_billable_ai_cost_eur": round(total_billable, 6),
+        "ai_billing_basis": ai_basis,
+        "evidence_status": worst_evidence,
+        "pricing_warnings": list(dict.fromkeys(pricing_warnings)),
+        "runs": run_summaries,
+    }
+
+
+def _float_or_none(value) -> Optional[float]:
+    """Return float or None for JSON field serialization."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# -----------------------------------------------------------------------
 # Task billing state
 # -----------------------------------------------------------------------
 
