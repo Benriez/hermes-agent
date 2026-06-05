@@ -1976,7 +1976,53 @@ def run_conversation(
                                 "Token persistence failed (session=%s, tokens=%d): %s",
                                 agent.session_id, total_tokens, e,
                             )
-                    
+
+                    # Card 2b: Wire Kanban context into token usage capture.
+                    # Dispatcher sets HERMES_KANBAN_TASK and HERMES_KANBAN_BOARD.
+                    # Attach board/task/run context to usage records when available.
+                    # Silent failure if context is unavailable — never blocks usage capture.
+                    try:
+                        import os as _os
+                        _kanban_task = _os.environ.get("HERMES_KANBAN_TASK")
+                        _kanban_board = _os.environ.get("HERMES_KANBAN_BOARD") or "default"
+                        if _kanban_task:
+                            from hermes_cli import kanban_db as _kb
+                            _conn = _kb.connect(board=_kanban_board)
+                            try:
+                                _run_id = _kb._current_run_id(_conn, _kanban_task)
+                            except Exception:
+                                _run_id = None
+                            finally:
+                                _conn.close()
+                            if _run_id is not None:
+                                _usage = {
+                                    "provider": agent.provider or "unknown",
+                                    "model": agent.model or "unknown",
+                                    "input_tokens": canonical_usage.input_tokens,
+                                    "output_tokens": canonical_usage.output_tokens,
+                                    "cached_tokens": canonical_usage.cache_read_tokens,
+                                    "reasoning_tokens": canonical_usage.reasoning_tokens,
+                                    "session_id": agent.session_id,
+                                    "pricing_source": "billing_model_pricing.json",
+                                    "pricing_found": False,
+                                    "pricing_manually_verified": False,
+                                    "raw_provider_cost_eur": None,
+                                    "billable_ai_cost_eur": None,
+                                    "evidence_status": "estimated",
+                                }
+                                try:
+                                    _conn2 = _kb.connect(board=_kanban_board)
+                                    try:
+                                        _kb.record_kanban_ai_usage(
+                                            _conn2, _kanban_task, _run_id, _kanban_board, _usage
+                                        )
+                                    finally:
+                                        _conn2.close()
+                                except Exception:
+                                    pass  # silent — never block usage capture
+                    except Exception:
+                        pass  # defensive — env vars may be absent in non-Kanban runs
+
                     if agent.verbose_logging:
                         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                     
