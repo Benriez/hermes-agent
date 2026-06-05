@@ -9628,6 +9628,136 @@ def get_billing_summary(conn: sqlite3.Connection, board_id: str, month: str) -> 
     }
 
 
+# -----------------------------------------------------------------------
+# Monthly AI/infrastructure cost summary (Card 3)
+# -----------------------------------------------------------------------
+
+
+def get_monthly_cost_summary(conn: sqlite3.Connection, board_id: str, month: str) -> dict:
+    """Return the monthly AI/infrastructure cost summary for ``board_id`` for ``month`` (YYYY-MM).
+
+    Separates estimated internal cost (raw provider cost) from customer
+    billable amount, with ``manually_verified`` and ``invoice_ready`` flags.
+
+    Records are sourced from ``task_runs.metadata.ai_usage_records``
+    filtered by ``recorded_at`` within the month range.
+
+    Returns empty/zeros with ``confidence_status='missing_config'`` when no
+    billing config exists for the board.  Does **not** mark estimates as
+    invoice-ready.
+    """
+    cfg = get_billing_config(conn, board_id)
+
+    if cfg is None:
+        return {
+            "board_id": board_id,
+            "month": month,
+            "currency": "EUR",
+            "ai_billing_basis": "none",
+            "task_count": 0,
+            "record_count": 0,
+            "estimated_internal_cost_eur": 0.0,
+            "customer_billable_cost_eur": 0.0,
+            "manually_verified": False,
+            "invoice_ready": False,
+            "confidence_status": "missing_config",
+        }
+
+    ai_basis = str(cfg.get("ai_billing_basis") or "none")
+    currency = str(cfg.get("currency") or "EUR")
+    month_start, month_end = _parse_month_range(month)
+
+    # The DB is per-board, so all rows in the tasks table belong to this board.
+    all_task_rows = conn.execute("SELECT id FROM tasks").fetchall()
+
+    total_raw_cost = 0.0
+    total_billable_cost = 0.0
+    all_verified = True
+    has_unready_evidence = False
+    has_estimates = False
+    record_count = 0
+
+    for task_row in all_task_rows:
+        task_id = str(task_row["id"])
+
+        # Query runs whose started_at falls within the month — fast filter.
+        # Individual usage records are further filtered by recorded_at below.
+        run_rows = conn.execute(
+            "SELECT metadata FROM task_runs"
+            " WHERE task_id = ? AND started_at >= ? AND started_at <= ?",
+            (task_id, month_start, month_end),
+        ).fetchall()
+
+        for (meta_json,) in run_rows:
+            if not meta_json:
+                continue
+            try:
+                meta = json.loads(meta_json)
+            except Exception:
+                continue
+            records = meta.get("ai_usage_records", [])
+            if not isinstance(records, list):
+                continue
+            for rec in records:
+                rec_ts = rec.get("recorded_at")
+                if rec_ts is not None and (int(rec_ts) < month_start or int(rec_ts) > month_end):
+                    continue
+
+                record_count += 1
+
+                raw = rec.get("raw_provider_cost_eur")
+                if raw is not None:
+                    total_raw_cost += float(raw)
+
+                bill = rec.get("billable_ai_cost_eur")
+                if bill is not None:
+                    total_billable_cost += float(bill)
+
+                if not rec.get("pricing_manually_verified", False):
+                    all_verified = False
+
+                ev = str(rec.get("evidence_status", "missing"))
+                if ev != "ready":
+                    has_unready_evidence = True
+                if ev in ("estimated", "missing"):
+                    has_estimates = True
+
+    # invoice_ready: only when all pricing is manually verified,
+    # all evidence is ready, and no estimates exist
+    invoice_ready = (
+        all_verified
+        and not has_unready_evidence
+        and not has_estimates
+        and record_count > 0
+    )
+
+    # Confidence status
+    if record_count == 0:
+        conf = "no_data"
+    elif invoice_ready:
+        conf = "high"
+    elif all_verified and not has_estimates:
+        conf = "high"
+    elif has_estimates:
+        conf = "medium"
+    else:
+        conf = "low"
+
+    return {
+        "board_id": board_id,
+        "month": month,
+        "currency": currency,
+        "ai_billing_basis": ai_basis,
+        "task_count": len(all_task_rows),
+        "record_count": record_count,
+        "estimated_internal_cost_eur": round(total_raw_cost, 6),
+        "customer_billable_cost_eur": round(total_billable_cost, 6),
+        "manually_verified": all_verified,
+        "invoice_ready": invoice_ready,
+        "confidence_status": conf,
+    }
+
+
 def _to_epoch(val) -> Optional[int]:
     """Normalise a timestamp to unix epoch seconds.
 

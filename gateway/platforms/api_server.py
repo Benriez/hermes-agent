@@ -4717,6 +4717,58 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"object": "hermes.billing_summary", "summary": summary})
 
+    async def _handle_get_cost_summary(self, request: "web.Request") -> "web.Response":
+        """GET /api/kanban/boards/:boardId/cost-summary?month=YYYY-MM — monthly AI cost summary."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        board_id = request.match_info.get("boardId")
+        if not board_id:
+            return web.json_response(
+                _openai_error("boardId is required", code="invalid_board_id"), status=400
+            )
+
+        month = request.query.get("month", "").strip()
+        if not month:
+            return web.json_response(
+                _openai_error(
+                    "month query parameter is required (format: YYYY-MM)",
+                    code="invalid_month",
+                ),
+                status=400,
+            )
+        import re as _re
+
+        if not _re.match(r"^\d{4}-\d{2}$", month):
+            return web.json_response(
+                _openai_error("month must be in YYYY-MM format", code="invalid_month"),
+                status=400,
+            )
+
+        try:
+            from hermes_cli import kanban_db as kb
+        except Exception as exc:
+            logger.exception("[api_server] failed to import kanban_db")
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        try:
+            with kb.connect(board=board_id) as conn:
+                summary = kb.get_monthly_cost_summary(conn, board_id, month)
+        except Exception as exc:
+            logger.exception(
+                "[api_server] get_monthly_cost_summary failed for board %s month %s",
+                board_id,
+                month,
+            )
+            return web.json_response(
+                _openai_error(str(exc), err_type="server_error"), status=500
+            )
+
+        return web.json_response({"object": "hermes.monthly_cost_summary", "summary": summary})
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -4818,6 +4870,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/kanban/tasks/{taskId}/ai-cost-summary", self._handle_get_ai_cost_summary)
             # Board billing summary API (monthly aggregation — no approval required)
             self._app.router.add_get("/api/kanban/boards/{boardId}/billing-summary", self._handle_get_billing_summary)
+            # Board cost summary API (monthly AI/infrastructure cost — Card 3)
+            self._app.router.add_get("/api/kanban/boards/{boardId}/cost-summary", self._handle_get_cost_summary)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

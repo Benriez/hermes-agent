@@ -3436,12 +3436,13 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
-def test_has_spawnable_review_true(kanban_home):
+def test_has_spawnable_review_true(kanban_home, monkeypatch):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "alice")
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="default")
+        t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
-        # default profile should exist in the test env
         assert kb.has_spawnable_review(conn) is True
 
 
@@ -4595,3 +4596,393 @@ def test_workstream_diagnostics_are_read_only(kanban_home):
         assert after_links == before_links
     finally:
         conn.close()
+
+
+# -------------------------------------------------------------------------------------
+# Deep-auditor pass / fail / rework scenarios
+# -------------------------------------------------------------------------------------
+
+# Needed by audit tests — monkeypatch the impl_assignee so the audit logic
+# routes deep-implementer completions through the review gate.
+_ORIG_COMPLETE_TASK_CFG = {}
+
+
+def _set_audit_config(conn, require_review=True, review_assignee="minimax-implementer"):
+    """Override kanban config so deep-implementer completions hit the review gate."""
+    import hermes_cli.kanban_db as _kb
+    _kb._audit_test_config = {
+        "require_review_after_implementation": require_review,
+        "review_assignee": review_assignee,
+    }
+
+
+def _clear_audit_config():
+    import hermes_cli.kanban_db as _kb
+    _kb._audit_test_config = None
+
+
+def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
+    """Test helper: set a task's status directly."""
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    conn.commit()
+
+
+def test_audit_pass_moves_review_to_done(kanban_home, monkeypatch):
+    """Passing audit (review_outcome=pass) transitions task from review -> done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        ok = kb.complete_task(
+            conn, t,
+            metadata={"review_outcome": "pass"},
+        )
+    assert ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+    assert task.status == "done"
+
+
+def test_audit_pass_creates_audit_passed_event(kanban_home):
+    """Passing audit emits an audit_passed event with outcome/auditor/timestamp."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(conn, t, metadata={"review_outcome": "pass"})
+    with kb.connect() as conn:
+        events = kb.list_events(conn, t)
+    audit_events = [e for e in events if e.kind == "audit_passed"]
+    assert len(audit_events) == 1
+    assert "outcome" in audit_events[0].payload
+
+
+def test_audit_pass_adds_comment(kanban_home):
+    """Passing audit adds a comment documenting the audit outcome."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(conn, t, metadata={"review_outcome": "pass"})
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, t)
+    audit_comments = [c for c in comments if "Audit" in c.body or "audit" in c.body]
+    assert len(audit_comments) >= 1
+
+
+def test_audit_pass_stores_evidence_in_run(kanban_home):
+    """Passing audit stores audit metadata in the task_runs row."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(conn, t, metadata={"review_outcome": "pass"})
+    with kb.connect() as conn:
+        runs = conn.execute("SELECT * FROM task_runs WHERE task_id = ?", (t,)).fetchall()
+    assert len(runs) >= 1
+    latest_run = runs[-1]
+    # The run should be marked completed, not failed
+    assert latest_run["outcome"] == "completed"
+
+
+def test_audit_fail_blocks_and_fires_event(kanban_home):
+    """Failing audit (review_outcome=fail) transitions task to blocked and fires audit_failed event."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        ok = kb.complete_task(
+            conn, t,
+            metadata={"review_outcome": "fail"},
+        )
+    assert ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+    assert task.status == "blocked"
+    audit_events = [e for e in events if e.kind == "audit_failed"]
+    assert len(audit_events) == 1
+
+
+def test_audit_fail_creates_rework_card(kanban_home):
+    """Failing audit creates a REWORK card with title, assignee, findings, required_changes."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(
+            conn, t,
+            metadata={
+                "review_outcome": "fail",
+                "findings": "Variable shadowing in helper.py line 42",
+                "required_changes": "Rename the shadowed variable",
+            },
+        )
+    with kb.connect() as conn:
+        links = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (t,)
+        ).fetchall()
+        rework_ids = [r["child_id"] for r in links]
+    assert len(rework_ids) == 1
+    rework_id = rework_ids[0]
+    with kb.connect() as conn:
+        rework = kb.get_task(conn, rework_id)
+        assert rework is not None
+        assert "REWORK" in rework.title or "rework" in rework.title.lower()
+        assert rework.assignee == "deep-implementer"
+
+
+def test_audit_fail_rework_card_constraints(kanban_home):
+    """REWORK card has preferred_profiles=deep-implementer, forbidden_profiles, skills, and prism in body."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(
+            conn, t,
+            metadata={"review_outcome": "fail"},
+        )
+    with kb.connect() as conn:
+        links = conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (t,)).fetchall()
+        rework_id = links[0]["child_id"]
+        rework = kb.get_task(conn, rework_id)
+        assert rework.body is not None
+        assert "preferred_profiles" in rework.body
+        assert "forbidden_profiles" in rework.body
+        assert "deep-implementer" in rework.body
+
+
+def test_audit_fail_adds_comment(kanban_home):
+    """Failing audit adds a comment documenting the failure and the REWORK card reference."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(
+            conn, t,
+            metadata={"review_outcome": "fail", "findings": "Off-by-one error"},
+        )
+    with kb.connect() as conn:
+        comments = kb.list_comments(conn, t)
+    assert len(comments) >= 1
+
+
+def test_audit_fail_is_deterministic(kanban_home):
+    """Calling complete_task with audit_fail twice creates only one REWORK card (idempotency)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(conn, t, metadata={"review_outcome": "fail"})
+    with kb.connect() as conn:
+        kb.complete_task(conn, t, metadata={"review_outcome": "fail"})
+    with kb.connect() as conn:
+        links = conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (t,)).fetchall()
+    assert len(links) == 1
+
+
+def test_audit_fail_rework_card_referenced_in_original(kanban_home):
+    """The original task's result or comment references the REWORK card id."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(
+            conn, t,
+            metadata={"review_outcome": "fail"},
+        )
+    with kb.connect() as conn:
+        links = conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (t,)).fetchall()
+        rework_id = links[0]["child_id"]
+        task = kb.get_task(conn, t)
+        comments = kb.list_comments(conn, t)
+    result_refs = (task.result or "") + "".join(c.body for c in comments)
+    assert rework_id in result_refs or any(rework_id in c.body for c in comments)
+
+
+def test_audit_fail_rework_card_is_ready(kanban_home):
+    """REWORK card is immediately dispatchable (status=ready)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(conn, t, metadata={"review_outcome": "fail"})
+    with kb.connect() as conn:
+        links = conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (t,)).fetchall()
+        rework_id = links[0]["child_id"]
+        rework = kb.get_task(conn, rework_id)
+    assert rework.status == "ready"
+
+
+def test_audit_fail_without_findings_uses_summary(kanban_home):
+    """When findings is absent, the REWORK card body falls back to the task summary."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+    with kb.connect() as conn:
+        kb.complete_task(
+            conn, t,
+            metadata={"review_outcome": "fail"},
+            result="Did not satisfy acceptance criteria",
+        )
+    with kb.connect() as conn:
+        links = conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (t,)).fetchall()
+        rework_id = links[0]["child_id"]
+        rework = kb.get_task(conn, rework_id)
+    assert rework.body is not None
+
+
+def test_audit_pass_without_claim_lock_still_works(kanban_home):
+    """Audit pass works even if the task has no claim_lock (auditor=None is handled gracefully)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unclaimed reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+        conn.execute("UPDATE tasks SET claim_lock = NULL WHERE id = ?", (t,))
+        conn.commit()
+    with kb.connect() as conn:
+        ok = kb.complete_task(conn, t, metadata={"review_outcome": "pass"})
+    assert ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+    assert task.status == "done"
+
+
+def test_audit_fail_without_claim_lock_still_works(kanban_home):
+    """Audit fail creates REWORK card even if the task has no claim_lock (auditor=None handled gracefully)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unclaimed reviewable", assignee="deep-implementer")
+        _set_task_status(conn, t, "review")
+        conn.execute("UPDATE tasks SET claim_lock = NULL WHERE id = ?", (t,))
+        conn.commit()
+    with kb.connect() as conn:
+        ok = kb.complete_task(conn, t, metadata={"review_outcome": "fail"})
+    assert ok is True
+    with kb.connect() as conn:
+        links = conn.execute("SELECT child_id FROM task_links WHERE parent_id = ?", (t,)).fetchall()
+    assert len(links) == 1
+
+
+def test_audit_no_review_outcome_does_not_trigger_audit(kanban_home):
+    """A task completing without review_outcome metadata goes straight to done (no audit side-effects)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="normal task", assignee="alice")
+    with kb.connect() as conn:
+        ok = kb.complete_task(conn, t, result="all good")
+    assert ok is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+    assert task.status == "done"
+    assert not any(e.kind in ("audit_passed", "audit_failed") for e in events)
+
+
+def test_audit_metadata_none_does_not_trigger_audit(kanban_home):
+    """complete_task with metadata=None does not emit audit events."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="normal task", assignee="alice")
+    with kb.connect() as conn:
+        ok = kb.complete_task(conn, t, result="done", metadata=None)
+    assert ok is True
+    with kb.connect() as conn:
+        events = kb.list_events(conn, t)
+    assert not any(e.kind in ("audit_passed", "audit_failed") for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Production Kanban assignee guard hardening regressions
+# ---------------------------------------------------------------------------
+
+
+def _enable_production_assignee_validation(monkeypatch, valid_profiles=None):
+    monkeypatch.setenv("HERMES_KANBAN_VALIDATE_ASSIGNEES", "1")
+    valid = set(valid_profiles or {"deep-implementer", "minimax-implementer"})
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in valid)
+
+
+def test_create_task_rejects_invalid_assignee_when_validation_enabled(kanban_home, monkeypatch):
+    _enable_production_assignee_validation(monkeypatch)
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="not a valid Kanban worker profile"):
+            kb.create_task(conn, title="bad assignee", assignee="alice")
+
+
+def test_assign_task_rejects_invalid_assignee_when_validation_enabled(kanban_home, monkeypatch):
+    _enable_production_assignee_validation(monkeypatch)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="good", assignee="deep-implementer")
+        with pytest.raises(ValueError, match="not a valid Kanban worker profile"):
+            kb.assign_task(conn, t, "alice")
+
+
+def test_review_routing_invalid_config_falls_back_to_minimax(kanban_home, monkeypatch):
+    _enable_production_assignee_validation(monkeypatch)
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "implementation_assignee": "deep-implementer",
+                "review_assignee": "alice",
+                "require_review_after_implementation": True,
+            }
+        },
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs review", assignee="deep-implementer")
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, t, result="implementation done") is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+    assert task.status == "review"
+    assert task.assignee == "minimax-implementer"
+
+
+def test_body_skip_review_completes_directly(kanban_home, monkeypatch):
+    _enable_production_assignee_validation(monkeypatch)
+    import hermes_cli.config as cfg
+
+    monkeypatch.setattr(
+        cfg,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "implementation_assignee": "deep-implementer",
+                "review_assignee": "minimax-implementer",
+                "require_review_after_implementation": True,
+            }
+        },
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="cleanup",
+            body="skip_review: true\nThis is operator cleanup.",
+            assignee="deep-implementer",
+        )
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, t, result="cleaned") is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+    assert task.status == "done"
+    assert task.assignee == "deep-implementer"
+
+
+def test_dispatch_default_assignee_invalid_does_not_mutate_task(kanban_home, monkeypatch):
+    _enable_production_assignee_validation(monkeypatch)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unassigned")
+        result = kb.dispatch_once(conn, default_assignee="alice", dry_run=False)
+        task = kb.get_task(conn, t)
+    assert t in result.skipped_unassigned
+    assert task.assignee is None
+
+
+def test_default_profile_is_not_spawnable_worker_route(kanban_home, monkeypatch):
+    _enable_production_assignee_validation(monkeypatch, valid_profiles={"default"})
+    with kb.connect() as conn:
+        kb.create_task(conn, title="default-owned", assignee="default")
+        assert kb.has_spawnable_ready(conn) is False
